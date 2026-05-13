@@ -345,6 +345,71 @@ logs/launchd.err.log
 
 The Mac must be awake and connected to the internet when the scheduled job runs.
 
+## Run DailyViral On GitHub Actions
+
+Step 1:
+Push the repo to GitHub.
+
+Step 2:
+In GitHub repo settings, create repository secrets:
+
+- `INSTAGRAM_ACCESS_TOKEN`
+- `DAILYVIRAL_VIDEO_URL`
+- `IG_USER_ID`
+- `INSTAGRAM_USERNAME`
+
+Step 3:
+Create repository variables:
+
+- `DAILYVIRAL_START_DATE`
+- `AUTO_POST_ENABLED`
+- `DRY_RUN`
+- `DAILYVIRAL_TIMEZONE`
+- `DAILYVIRAL_CAPTION_TEMPLATE`
+- `DAILYVIRAL_HASHTAGS`
+
+Example variables:
+
+```text
+DAILYVIRAL_START_DATE=2026-05-12
+AUTO_POST_ENABLED=true
+DRY_RUN=false
+DAILYVIRAL_TIMEZONE=America/Los_Angeles
+DAILYVIRAL_CAPTION_TEMPLATE=Day {day_number} of posting this meme
+DAILYVIRAL_HASHTAGS=#meme #reels #daily
+```
+
+Step 4:
+GitHub cron is in UTC, not local time.
+
+Examples:
+
+- `16:00 UTC` is `9 AM Pacific Daylight Time`
+- `17:00 UTC` is `9 AM Pacific Standard Time`
+
+The workflow file lives at `.github/workflows/dailyviral.yml`. Edit the cron line there if you want a different UTC schedule.
+
+Step 5:
+Run the workflow manually once with `dry_run_override=true`.
+
+Step 6:
+If dry run logs look correct, set `DRY_RUN=false` and run manually once without dry run or wait for the scheduled run.
+
+The GitHub Actions daily command is:
+
+```bash
+python -m dailyviral gha-post-daily main_meme_account
+```
+
+This mode is stateless:
+
+- it does not require `data/posts.sqlite`
+- it does not require local `.env`
+- it reads GitHub Actions environment variables only
+- it computes the day number from `DAILYVIRAL_START_DATE`
+- it tries to avoid duplicate posts by checking recent media captions through the official API
+- `--force` bypasses that duplicate-caption check for manual reruns
+
 ## Status And Analytics
 
 Queue overview:

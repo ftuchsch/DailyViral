@@ -1,0 +1,74 @@
+name: DailyViral
+
+on:
+  schedule:
+    - cron: "0 16 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run_override:
+        description: "Force DRY_RUN=true for this manual run"
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      force:
+        description: "Bypass recent-caption duplicate checks"
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dailyviral-main-meme-account
+  cancel-in-progress: false
+
+jobs:
+  post-daily:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run DailyViral
+        env:
+          INSTAGRAM_ACCESS_TOKEN: ${{ secrets.INSTAGRAM_ACCESS_TOKEN }}
+          DAILYVIRAL_VIDEO_URL: ${{ secrets.DAILYVIRAL_VIDEO_URL }}
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+          INSTAGRAM_USERNAME: ${{ secrets.INSTAGRAM_USERNAME }}
+          DAILYVIRAL_START_DATE: ${{ vars.DAILYVIRAL_START_DATE }}
+          AUTO_POST_ENABLED: ${{ vars.AUTO_POST_ENABLED }}
+          DRY_RUN: ${{ vars.DRY_RUN }}
+          DAILYVIRAL_CAPTION_TEMPLATE: ${{ vars.DAILYVIRAL_CAPTION_TEMPLATE }}
+          DAILYVIRAL_HASHTAGS: ${{ vars.DAILYVIRAL_HASHTAGS }}
+          DAILYVIRAL_TIMEZONE: ${{ vars.DAILYVIRAL_TIMEZONE }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.dry_run_override }}" == "true" ]]; then
+            export DRY_RUN=true
+          fi
+
+          FORCE_FLAG=""
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.force }}" == "true" ]]; then
+            FORCE_FLAG="--force"
+          fi
+
+          python -m dailyviral gha-post-daily main_meme_account ${FORCE_FLAG}

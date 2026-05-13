@@ -37,6 +37,16 @@ class InstagramPublishResult:
     limit: PublishingLimit | None
 
 
+@dataclass(slots=True)
+class InstagramMediaRecord:
+    media_id: str
+    caption: str
+    timestamp: str | None
+    permalink: str | None
+    media_type: str | None
+    media_product_type: str | None
+
+
 class InstagramClient:
     def __init__(
         self,
@@ -232,6 +242,44 @@ class InstagramClient:
         permalink = str(payload.get("permalink", "")).strip()
         self.logger.info("Fetched media details for %s: %s", media_id, payload)
         return permalink or None
+
+    def fetch_recent_media(
+        self,
+        *,
+        account: AccountConfig,
+        limit: int = 10,
+    ) -> list[InstagramMediaRecord]:
+        token = require_access_token(account)
+        payload = self._request_json(
+            "GET",
+            f"/{account.ig_user_id}/media",
+            token=token,
+            params={
+                "fields": "id,caption,timestamp,permalink,media_type,media_product_type",
+                "limit": str(limit),
+            },
+        )
+        rows = payload.get("data", [])
+        if not isinstance(rows, list):
+            raise InstagramApiError(
+                f"Instagram recent media response was not a list: {payload}"
+            )
+
+        records: list[InstagramMediaRecord] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            records.append(
+                InstagramMediaRecord(
+                    media_id=str(row.get("id", "")).strip(),
+                    caption=str(row.get("caption", "") or "").strip(),
+                    timestamp=str(row.get("timestamp", "")).strip() or None,
+                    permalink=str(row.get("permalink", "")).strip() or None,
+                    media_type=str(row.get("media_type", "")).strip() or None,
+                    media_product_type=str(row.get("media_product_type", "")).strip() or None,
+                )
+            )
+        return records
 
     def _request_json(
         self,

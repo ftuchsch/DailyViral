@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from . import __version__
 from .analytics import build_report
-from .captions import CaptionResolution, prepare_new_post, resolve_caption
+from .captions import CaptionResolution, compose_caption, prepare_new_post, resolve_caption
 from .config import (
     AccountConfig,
     DEFAULT_ACCOUNTS_PATH,
@@ -36,6 +36,9 @@ from .queue import PostRecord, QueueStore
 from .url_validation import UrlValidationResult, validate_public_video_url
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_GHA_CAPTION_TEMPLATE = "Day {day_number} of posting this meme"
+DEFAULT_GHA_HASHTAGS = "#meme #reels #daily"
+DEFAULT_GHA_TIMEZONE = "America/Los_Angeles"
 REQUIRED_CHECK_ENV_VARS = (
     "AUTO_POST_ENABLED",
     "DRY_RUN",
@@ -57,6 +60,13 @@ ACCOUNT_REQUIRED_COMMANDS = {
     "schedule-days",
     "upcoming",
 }
+GHA_DAILY_REQUIRED_ENV_VARS = (
+    "INSTAGRAM_ACCESS_TOKEN",
+    "DAILYVIRAL_VIDEO_URL",
+    "IG_USER_ID",
+    "INSTAGRAM_USERNAME",
+    "DAILYVIRAL_START_DATE",
+)
 
 
 @dataclass(slots=True)
@@ -81,6 +91,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         config = load_config(require_accounts=args.command in ACCOUNT_REQUIRED_COMMANDS)
         logger = setup_logging(config.settings.log_path)
+
+        if args.command == "gha-post-daily":
+            return handle_gha_post_daily(args, config.settings, logger)
+
         queue_store = QueueStore(config.settings.database_path)
         queue_store.initialize()
 
@@ -227,6 +241,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     cron_parser.add_argument("account_name")
     cron_parser.add_argument("--time", required=True)
+
+    gha_parser = subparsers.add_parser(
+        "gha-post-daily",
+        help="Stateless GitHub Actions daily posting mode using env vars only.",
+    )
+    gha_parser.add_argument("account_name")
+    gha_parser.add_argument("--force", action="store_true", help="Bypass recent-caption duplicate checks.")
 
     return parser
 
@@ -645,6 +666,98 @@ def handle_make_cron(args: argparse.Namespace, config: AppConfig) -> int:
         python_executable=Path(sys.executable),
     )
     print(cron_line)
+    return 0
+
+
+def handle_gha_post_daily(
+    args: argparse.Namespace,
+    settings: AppSettings,
+    logger: logging.Logger,
+) -> int:
+    env_values = load_gha_env_values()
+    account = build_gha_account(
+        account_name=args.account_name,
+        env_values=env_values,
+    )
+
+    local_today = _local_today(env_values["timezone"])
+    day_number = calculate_gha_day_number(
+        start_date=env_values["start_date"],
+        local_today=local_today,
+    )
+    day_caption = env_values["caption_template"].format(day_number=day_number)
+    final_caption = compose_caption(
+        caption=day_caption,
+        hashtags=env_values["hashtags"],
+    )
+    validation = validate_public_video_url(
+        env_values["video_url"],
+        timeout_seconds=settings.http_timeout_seconds,
+    )
+
+    print("GitHub Actions daily post")
+    print(f"  Account: {account.account_name}")
+    print(f"  Date: {local_today.isoformat()}")
+    print(f"  Day number: {day_number}")
+    print(f"  Instagram username: {account.instagram_username}")
+    print(f"  IG User ID: {account.ig_user_id}")
+    print(f"  Video URL: {env_values['video_url']}")
+    print(f"  Final caption: {final_caption}")
+    print(f"  INSTAGRAM_ACCESS_TOKEN: {mask_secret(_require_env_value('INSTAGRAM_ACCESS_TOKEN'))}")
+    print(f"  AUTO_POST_ENABLED: {str(settings.auto_post_enabled).lower()}")
+    print(f"  DRY_RUN: {str(settings.dry_run).lower()}")
+
+    if not validation.ok:
+        print(f"Validation failed: {validation.message}")
+        return 1
+
+    if not settings.auto_post_enabled:
+        print("AUTO_POST_ENABLED is not true. Dry-run only; skipping publish.")
+        return 0
+    if settings.dry_run:
+        print("DRY_RUN is true. Dry-run only; skipping publish.")
+        return 0
+
+    client = InstagramClient(settings, logger=logger)
+    recent_media_result = check_recent_caption_duplicate(
+        client=client,
+        account=account,
+        expected_caption_fragment=day_caption,
+        force=args.force,
+    )
+    if recent_media_result == "already-posted":
+        print("Already posted today")
+        return 0
+    if recent_media_result == "cannot-check":
+        return 1
+
+    try:
+        logger.info(
+            "GitHub Actions posting account=%s date=%s day_number=%s video_url=%s caption=%s",
+            account.account_name,
+            local_today.isoformat(),
+            day_number,
+            env_values["video_url"],
+            final_caption,
+        )
+        result = client.publish_reel(
+            account=account,
+            video_url=env_values["video_url"],
+            caption=final_caption,
+        )
+    except InstagramApiError as exc:
+        logger.error(
+            "GitHub Actions posting failed account=%s date=%s error=%s",
+            account.account_name,
+            local_today.isoformat(),
+            exc,
+        )
+        print(f"Posting failed: {exc}")
+        return 1
+
+    print(f"Posted media id: {result.media_id}")
+    if result.permalink:
+        print(f"Permalink: {result.permalink}")
     return 0
 
 
@@ -1078,6 +1191,72 @@ def _print_post_details(*, post: PostRecord, account: AccountConfig, final_capti
     print(f"  Final caption: {final_caption or '<empty>'}")
     print(f"  Scheduled date: {post.scheduled_date}")
     print(f"  Status: {post.status}")
+
+
+def load_gha_env_values() -> dict[str, str]:
+    values = {name: _require_env_value(name) for name in GHA_DAILY_REQUIRED_ENV_VARS}
+    values["caption_template"] = getenv_stripped("DAILYVIRAL_CAPTION_TEMPLATE") or DEFAULT_GHA_CAPTION_TEMPLATE
+    values["hashtags"] = getenv_stripped("DAILYVIRAL_HASHTAGS") or DEFAULT_GHA_HASHTAGS
+    values["timezone"] = getenv_stripped("DAILYVIRAL_TIMEZONE") or DEFAULT_GHA_TIMEZONE
+    values["start_date"] = _validate_date_string(values["DAILYVIRAL_START_DATE"])
+    values["video_url"] = values["DAILYVIRAL_VIDEO_URL"]
+    return values
+
+
+def build_gha_account(*, account_name: str, env_values: dict[str, str]) -> AccountConfig:
+    account = AccountConfig(
+        account_name=account_name,
+        instagram_username=env_values["INSTAGRAM_USERNAME"],
+        ig_user_id=env_values["IG_USER_ID"],
+        access_token_env_var="INSTAGRAM_ACCESS_TOKEN",
+        default_caption_template=env_values["caption_template"],
+        default_hashtags=env_values["hashtags"],
+        required_hashtags="",
+        timezone=env_values["timezone"],
+    )
+    _assert_account_publish_config(account)
+    return account
+
+
+def calculate_gha_day_number(*, start_date: str, local_today: date) -> int:
+    first_day = _parse_date(start_date)
+    delta_days = (local_today - first_day).days
+    if delta_days < 0:
+        raise ConfigurationError(
+            f"DAILYVIRAL_START_DATE {start_date} is in the future relative to {local_today.isoformat()}."
+        )
+    return delta_days + 1
+
+
+def check_recent_caption_duplicate(
+    *,
+    client: InstagramClient,
+    account: AccountConfig,
+    expected_caption_fragment: str,
+    force: bool,
+) -> str:
+    if force:
+        print("Force flag enabled. Skipping recent-caption duplicate check.")
+        return "force"
+
+    try:
+        recent_media = client.fetch_recent_media(account=account, limit=12)
+    except InstagramApiError as exc:
+        print(
+            "Warning: could not check recent media captions through the official API. "
+            f"Error: {exc}"
+        )
+        print("Retry with --force only if you are certain this run has not already posted today.")
+        return "cannot-check"
+
+    for record in recent_media:
+        if expected_caption_fragment in record.caption:
+            print(
+                "Recent media caption match found: "
+                f"{record.media_id or '<unknown id>'} {record.permalink or '<no permalink>'}"
+            )
+            return "already-posted"
+    return "not-found"
 
 
 def _require_env_value(name: str) -> str:
