@@ -454,6 +454,26 @@ When `ENABLE_VIDEO_OVERLAY=true`, GitHub Actions will:
 
 When `ENABLE_VIDEO_OVERLAY=false`, DailyViral keeps the previous behavior and posts `DAILYVIRAL_VIDEO_URL` directly.
 
+## Why Did The Scheduled Post Not Run?
+
+Common causes:
+
+- the workflow was pushed after the scheduled time for that day had already passed
+- GitHub cron uses UTC, not your local timezone
+- GitHub scheduled workflows can be delayed
+- `AUTO_POST_ENABLED` was `false`
+- `DRY_RUN` was `true`
+- the workflow file was not on the default branch
+- GitHub Actions were disabled for the repository
+- the scheduled run will not appear until the first scheduled time after the workflow file is committed on the default branch
+
+To verify tomorrow's run safely:
+
+- check the repository Variables and Secrets in GitHub
+- run `python -m dailyviral gha-schedule-readiness main_meme_account`
+- manually run the workflow once with `dry_run_override=true`
+- confirm the logs show the correct next day number and the correct overlay sentence
+
 ## Status And Analytics
 
 Queue overview:

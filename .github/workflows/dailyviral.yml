@@ -2,7 +2,8 @@ name: DailyViral
 
 on:
   schedule:
-    - cron: "0 16 * * *"
+    # GitHub cron uses UTC. 16:17 UTC is 9:17 AM PDT.
+    - cron: "17 16 * * *"
   workflow_dispatch:
     inputs:
       dry_run_override:
@@ -47,6 +48,53 @@ jobs:
           sudo apt-get install -y ffmpeg
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      - name: Debug scheduled-run inputs
+        env:
+          INSTAGRAM_ACCESS_TOKEN: ${{ secrets.INSTAGRAM_ACCESS_TOKEN }}
+          DAILYVIRAL_VIDEO_URL: ${{ secrets.DAILYVIRAL_VIDEO_URL }}
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+          INSTAGRAM_USERNAME: ${{ secrets.INSTAGRAM_USERNAME }}
+          DAILYVIRAL_START_DATE: ${{ vars.DAILYVIRAL_START_DATE }}
+          AUTO_POST_ENABLED: ${{ vars.AUTO_POST_ENABLED }}
+          DRY_RUN: ${{ vars.DRY_RUN }}
+          DAILYVIRAL_TIMEZONE: ${{ vars.DAILYVIRAL_TIMEZONE }}
+          ENABLE_VIDEO_OVERLAY: ${{ vars.ENABLE_VIDEO_OVERLAY || 'false' }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+          R2_PUBLIC_BASE_URL: ${{ secrets.R2_PUBLIC_BASE_URL }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          secret_state() {
+            local name="$1"
+            if [[ -n "${!name:-}" ]]; then
+              echo "yes"
+            else
+              echo "no"
+            fi
+          }
+
+          echo "UTC time: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          echo "Event name: ${{ github.event_name }}"
+          echo "Branch name: ${{ github.ref_name }}"
+          echo "AUTO_POST_ENABLED: ${AUTO_POST_ENABLED:-<missing>}"
+          echo "DRY_RUN: ${DRY_RUN:-<missing>}"
+          echo "ENABLE_VIDEO_OVERLAY: ${ENABLE_VIDEO_OVERLAY:-<missing>}"
+          echo "DAILYVIRAL_START_DATE: ${DAILYVIRAL_START_DATE:-<missing>}"
+          echo "DAILYVIRAL_TIMEZONE: ${DAILYVIRAL_TIMEZONE:-<missing>}"
+          echo "INSTAGRAM_ACCESS_TOKEN set: $(secret_state INSTAGRAM_ACCESS_TOKEN)"
+          echo "DAILYVIRAL_VIDEO_URL set: $(secret_state DAILYVIRAL_VIDEO_URL)"
+          echo "IG_USER_ID set: $(secret_state IG_USER_ID)"
+          echo "INSTAGRAM_USERNAME set: $(secret_state INSTAGRAM_USERNAME)"
+          echo "R2_ACCESS_KEY_ID set: $(secret_state R2_ACCESS_KEY_ID)"
+          echo "R2_SECRET_ACCESS_KEY set: $(secret_state R2_SECRET_ACCESS_KEY)"
+          echo "R2_ACCOUNT_ID set: $(secret_state R2_ACCOUNT_ID)"
+          echo "R2_BUCKET_NAME set: $(secret_state R2_BUCKET_NAME)"
+          echo "R2_PUBLIC_BASE_URL set: $(secret_state R2_PUBLIC_BASE_URL)"
 
       - name: Run DailyViral
         env:

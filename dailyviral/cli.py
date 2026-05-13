@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import logging
 import os
 import plistlib
+import re
 import shlex
 import shutil
 import subprocess
@@ -38,6 +40,7 @@ from .url_validation import UrlValidationResult, validate_public_video_url
 from .video_overlay import (
     build_overlay_render_plan,
     download_video,
+    load_overlay_messages,
     render_overlay_video,
     select_overlay_sentence,
 )
@@ -47,6 +50,8 @@ DEFAULT_GHA_CAPTION_TEMPLATE = "Day {day_number} of posting this meme"
 DEFAULT_GHA_HASHTAGS = "#meme #reels #daily"
 DEFAULT_GHA_TIMEZONE = "America/Los_Angeles"
 DEFAULT_GHA_ENABLE_VIDEO_OVERLAY = "false"
+DEFAULT_GHA_SCHEDULE_CRON = "17 16 * * *"
+WORKFLOW_PATH = PROJECT_ROOT / ".github" / "workflows" / "dailyviral.yml"
 REQUIRED_CHECK_ENV_VARS = (
     "AUTO_POST_ENABLED",
     "DRY_RUN",
@@ -75,6 +80,13 @@ GHA_DAILY_REQUIRED_ENV_VARS = (
     "INSTAGRAM_USERNAME",
     "DAILYVIRAL_START_DATE",
 )
+R2_REQUIRED_ENV_VARS = (
+    "R2_ACCESS_KEY_ID",
+    "R2_SECRET_ACCESS_KEY",
+    "R2_ACCOUNT_ID",
+    "R2_BUCKET_NAME",
+    "R2_PUBLIC_BASE_URL",
+)
 
 
 @dataclass(slots=True)
@@ -102,6 +114,8 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "gha-post-daily":
             return handle_gha_post_daily(args, config.settings, logger)
+        if args.command == "gha-schedule-readiness":
+            return handle_gha_schedule_readiness(args, config.settings)
 
         queue_store = QueueStore(config.settings.database_path)
         queue_store.initialize()
@@ -256,6 +270,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     gha_parser.add_argument("account_name")
     gha_parser.add_argument("--force", action="store_true", help="Bypass recent-caption duplicate checks.")
+
+    readiness_parser = subparsers.add_parser(
+        "gha-schedule-readiness",
+        help="Non-posting preflight report for the next GitHub Actions scheduled overlay post.",
+    )
+    readiness_parser.add_argument("account_name")
 
     return parser
 
@@ -699,6 +719,7 @@ def handle_gha_post_daily(
         hashtags=env_values["hashtags"],
     )
     overlay_enabled = _env_flag(env_values["enable_video_overlay"])
+    event_mode = getenv_stripped("GITHUB_EVENT_NAME") or "local-shell"
     overlay_sentence = None
     if overlay_enabled:
         overlay_sentence = select_overlay_sentence(
@@ -721,6 +742,7 @@ def handle_gha_post_daily(
         )
 
     print("GitHub Actions daily post")
+    print(f"  Event mode: {event_mode}")
     print(f"  Account: {account.account_name}")
     print(f"  Date: {local_today.isoformat()}")
     print(f"  Day number: {day_number}")
@@ -736,6 +758,14 @@ def handle_gha_post_daily(
     print(f"  INSTAGRAM_ACCESS_TOKEN: {mask_secret(_require_env_value('INSTAGRAM_ACCESS_TOKEN'))}")
     print(f"  AUTO_POST_ENABLED: {str(settings.auto_post_enabled).lower()}")
     print(f"  DRY_RUN: {str(settings.dry_run).lower()}")
+    if not settings.auto_post_enabled:
+        print("  Action: skip publish because AUTO_POST_ENABLED is not true")
+    elif settings.dry_run:
+        print("  Action: dry run only because DRY_RUN is true")
+    elif not overlay_enabled:
+        print("  Action: skip publish because ENABLE_VIDEO_OVERLAY is not true")
+    else:
+        print("  Action: preflight for a real overlay post")
 
     if not validation.ok:
         print(f"Validation failed: {validation.message}")
@@ -751,6 +781,20 @@ def handle_gha_post_daily(
         if overlay_enabled:
             print("Overlay mode dry run: would render a generated MP4, skip the R2 upload, and skip the Instagram publish.")
         return 0
+    if not overlay_enabled:
+        print("ENABLE_VIDEO_OVERLAY is not true. Refusing to run a real GitHub Actions post without overlay mode.")
+        return 1
+
+    preflight_reasons = build_gha_overlay_real_post_blockers(
+        settings=settings,
+        env_values=env_values,
+        validation=validation,
+    )
+    if preflight_reasons:
+        print("Overlay posting is not ready:")
+        for reason in preflight_reasons:
+            print(f"  - {reason}")
+        return 1
 
     client = InstagramClient(settings, logger=logger)
     recent_media_result = check_recent_caption_duplicate(
@@ -766,35 +810,34 @@ def handle_gha_post_daily(
         return 1
 
     post_video_url = base_video_url
-    if overlay_enabled:
-        r2_config = load_r2_config_from_env()
-        object_key = build_generated_object_key(day_number=day_number, local_date=local_today)
-        render_plan = build_overlay_render_plan(
-            day_number=day_number,
-            local_date=local_today,
-            output_root=PROJECT_ROOT / "generated",
-            overlay_sentence=overlay_sentence or "",
-        )
-        logger.info(
-            "GitHub Actions overlay render starting account=%s day_number=%s base_video_url=%s object_key=%s overlay=%s",
-            account.account_name,
-            day_number,
-            base_video_url,
-            object_key,
-            overlay_sentence,
-        )
-        download_video(
-            url=base_video_url,
-            destination=render_plan.downloaded_video_path,
-            timeout_seconds=settings.http_timeout_seconds,
-        )
-        rendered_path = render_overlay_video(plan=render_plan)
-        post_video_url = upload_video_to_r2(
-            file_path=rendered_path,
-            object_key=object_key,
-            config=r2_config,
-        )
-        print(f"  Generated video URL: {post_video_url}")
+    r2_config = load_r2_config_from_env()
+    object_key = build_generated_object_key(day_number=day_number, local_date=local_today)
+    render_plan = build_overlay_render_plan(
+        day_number=day_number,
+        local_date=local_today,
+        output_root=PROJECT_ROOT / "generated",
+        overlay_sentence=overlay_sentence or "",
+    )
+    logger.info(
+        "GitHub Actions overlay render starting account=%s day_number=%s base_video_url=%s object_key=%s overlay=%s",
+        account.account_name,
+        day_number,
+        base_video_url,
+        object_key,
+        overlay_sentence,
+    )
+    download_video(
+        url=base_video_url,
+        destination=render_plan.downloaded_video_path,
+        timeout_seconds=settings.http_timeout_seconds,
+    )
+    rendered_path = render_overlay_video(plan=render_plan)
+    post_video_url = upload_video_to_r2(
+        file_path=rendered_path,
+        object_key=object_key,
+        config=r2_config,
+    )
+    print(f"  Generated video URL: {post_video_url}")
 
     try:
         logger.info(
@@ -824,6 +867,140 @@ def handle_gha_post_daily(
     if result.permalink:
         print(f"Permalink: {result.permalink}")
     return 0
+
+
+def handle_gha_schedule_readiness(
+    args: argparse.Namespace,
+    settings: AppSettings,
+) -> int:
+    timezone_name = getenv_stripped("DAILYVIRAL_TIMEZONE") or DEFAULT_GHA_TIMEZONE
+    utc_now = datetime.now(timezone.utc)
+    local_now = _now_in_timezone(timezone_name)
+    cron_expression = read_gha_workflow_cron_expression() or DEFAULT_GHA_SCHEDULE_CRON
+
+    env_presence = {name: bool(getenv_stripped(name)) for name in GHA_DAILY_REQUIRED_ENV_VARS}
+    r2_presence = {name: bool(getenv_stripped(name)) for name in R2_REQUIRED_ENV_VARS}
+    auto_post_enabled = settings.auto_post_enabled
+    dry_run = settings.dry_run
+    overlay_enabled = _env_flag(getenv_stripped("ENABLE_VIDEO_OVERLAY") or DEFAULT_GHA_ENABLE_VIDEO_OVERLAY)
+    video_url = getenv_stripped("DAILYVIRAL_VIDEO_URL")
+    start_date_value = getenv_stripped("DAILYVIRAL_START_DATE")
+    caption_template = getenv_stripped("DAILYVIRAL_CAPTION_TEMPLATE") or DEFAULT_GHA_CAPTION_TEMPLATE
+    hashtags = getenv_stripped("DAILYVIRAL_HASHTAGS") or DEFAULT_GHA_HASHTAGS
+
+    reasons: list[str] = []
+    start_date = ""
+    today_day_number: int | None = None
+    tomorrow_day_number: int | None = None
+    tomorrow_caption = ""
+    tomorrow_overlay = ""
+
+    if not start_date_value:
+        reasons.append("DAILYVIRAL_START_DATE is missing.")
+    else:
+        try:
+            start_date = _validate_date_string(start_date_value)
+            today_day_number = calculate_gha_day_number(
+                start_date=start_date,
+                local_today=local_now.date(),
+            )
+            tomorrow_day_number = calculate_gha_day_number(
+                start_date=start_date,
+                local_today=(local_now + timedelta(days=1)).date(),
+            )
+            tomorrow_caption = compose_caption(
+                caption=caption_template.format(day_number=tomorrow_day_number),
+                hashtags=hashtags,
+            )
+        except (ConfigurationError, KeyError, ValueError) as exc:
+            reasons.append(f"Could not compute day numbers from DAILYVIRAL_START_DATE: {exc}")
+
+    overlay_csv_path = PROJECT_ROOT / "config" / "overlay_messages.csv"
+    overlay_csv_ok = False
+    try:
+        load_overlay_messages(overlay_csv_path)
+        overlay_csv_ok = True
+        if tomorrow_day_number is not None:
+            tomorrow_overlay = select_overlay_sentence(
+                day_number=tomorrow_day_number,
+                csv_path=overlay_csv_path,
+            )
+    except ConfigurationError as exc:
+        reasons.append(str(exc))
+
+    validation: UrlValidationResult | None = None
+    if video_url:
+        validation = validate_public_video_url(
+            video_url,
+            timeout_seconds=settings.http_timeout_seconds,
+        )
+        if not validation.ok:
+            reasons.append(f"Base video URL is not reachable: {validation.message}")
+    else:
+        reasons.append("DAILYVIRAL_VIDEO_URL is missing.")
+
+    ffmpeg_available = shutil.which("ffmpeg") is not None
+    boto3_installed = importlib.util.find_spec("boto3") is not None
+
+    if not auto_post_enabled:
+        reasons.append("AUTO_POST_ENABLED is not true.")
+    if dry_run:
+        reasons.append("DRY_RUN is true.")
+    if not overlay_enabled:
+        reasons.append("ENABLE_VIDEO_OVERLAY is not true.")
+
+    for name, present in env_presence.items():
+        if not present:
+            reasons.append(f"{name} is missing.")
+    for name, present in r2_presence.items():
+        if not present:
+            reasons.append(f"{name} is missing.")
+
+    ig_user_id = getenv_stripped("IG_USER_ID")
+    if ig_user_id and is_placeholder_ig_user_id(ig_user_id):
+        reasons.append("IG_USER_ID still looks like a placeholder.")
+    if not ffmpeg_available:
+        reasons.append("ffmpeg is not available in PATH.")
+    if not boto3_installed:
+        reasons.append("boto3 is not installed.")
+    if not overlay_csv_ok:
+        reasons.append("Overlay message CSV is not readable.")
+
+    ready = not reasons
+
+    print("GitHub Actions schedule readiness")
+    print(f"  Account: {args.account_name}")
+    print(f"  Current UTC time: {utc_now.isoformat()}")
+    print(f"  Current {timezone_name} time: {local_now.isoformat()}")
+    print(f"  Workflow cron: {cron_expression}")
+    print(f"  DAILYVIRAL_START_DATE: {start_date_value or '<missing>'}")
+    print(f"  Today's day number: {today_day_number if today_day_number is not None else '<unavailable>'}")
+    print(f"  Tomorrow's day number: {tomorrow_day_number if tomorrow_day_number is not None else '<unavailable>'}")
+    print(f"  Expected caption for tomorrow: {tomorrow_caption or '<unavailable>'}")
+    print(f"  Expected overlay sentence for tomorrow: {tomorrow_overlay or '<unavailable>'}")
+    print(f"  AUTO_POST_ENABLED: {str(auto_post_enabled).lower()}")
+    print(f"  DRY_RUN: {str(dry_run).lower()}")
+    print(f"  ENABLE_VIDEO_OVERLAY: {str(overlay_enabled).lower()}")
+    print("  Instagram env vars:")
+    for name, present in env_presence.items():
+        print(f"    {name}: {'yes' if present else 'no'}")
+    print("  R2 env vars:")
+    for name, present in r2_presence.items():
+        print(f"    {name}: {'yes' if present else 'no'}")
+    print(f"  Base video URL reachable: {'yes' if validation and validation.ok else 'no'}")
+    print(f"  ffmpeg available: {'yes' if ffmpeg_available else 'no'}")
+    print(f"  boto3 installed: {'yes' if boto3_installed else 'no'}")
+
+    if ready:
+        print()
+        print("READY FOR NEXT SCHEDULED POST")
+        return 0
+
+    print()
+    print("NOT READY")
+    for reason in sorted(dict.fromkeys(reasons)):
+        print(f"  - {reason}")
+    return 1
 
 
 def schedule_days_for_account(
@@ -1269,6 +1446,53 @@ def load_gha_env_values() -> dict[str, str]:
     return values
 
 
+def build_gha_overlay_real_post_blockers(
+    *,
+    settings: AppSettings,
+    env_values: dict[str, str],
+    validation: UrlValidationResult,
+) -> list[str]:
+    reasons: list[str] = []
+
+    for name in GHA_DAILY_REQUIRED_ENV_VARS:
+        if not env_values.get(name):
+            reasons.append(f"{name} is missing.")
+    for name in R2_REQUIRED_ENV_VARS:
+        if not getenv_stripped(name):
+            reasons.append(f"{name} is missing.")
+
+    if not getenv_stripped("INSTAGRAM_ACCESS_TOKEN"):
+        reasons.append("INSTAGRAM_ACCESS_TOKEN is missing.")
+    if not getenv_stripped("IG_USER_ID"):
+        reasons.append("IG_USER_ID is missing.")
+    elif is_placeholder_ig_user_id(getenv_stripped("IG_USER_ID")):
+        reasons.append("IG_USER_ID still looks like a placeholder.")
+    if not validation.ok:
+        reasons.append(f"Base video URL is not reachable: {validation.message}")
+    if shutil.which("ffmpeg") is None:
+        reasons.append("ffmpeg is not available in PATH.")
+    if importlib.util.find_spec("boto3") is None:
+        reasons.append("boto3 is not installed.")
+    overlay_csv_path = PROJECT_ROOT / "config" / "overlay_messages.csv"
+    try:
+        load_overlay_messages(overlay_csv_path)
+    except ConfigurationError as exc:
+        reasons.append(str(exc))
+
+    return reasons
+
+
+def read_gha_workflow_cron_expression() -> str | None:
+    if not WORKFLOW_PATH.exists():
+        return None
+
+    content = WORKFLOW_PATH.read_text(encoding="utf-8")
+    match = re.search(r'cron:\s*"([^"]+)"', content)
+    if match:
+        return match.group(1).strip()
+    return None
+
+
 def build_gha_account(*, account_name: str, env_values: dict[str, str]) -> AccountConfig:
     account = AccountConfig(
         account_name=account_name,
@@ -1396,12 +1620,16 @@ def _parse_date(value: str) -> date:
         ) from exc
 
 
-def _local_today(timezone_name: str) -> date:
+def _now_in_timezone(timezone_name: str) -> datetime:
     try:
         zone = ZoneInfo(timezone_name)
     except ZoneInfoNotFoundError as exc:
         raise ConfigurationError(f"Unknown timezone '{timezone_name}'.") from exc
-    return datetime.now(zone).date()
+    return datetime.now(zone)
+
+
+def _local_today(timezone_name: str) -> date:
+    return _now_in_timezone(timezone_name).date()
 
 
 def _today_in_timezone(timezone_name: str) -> str:
