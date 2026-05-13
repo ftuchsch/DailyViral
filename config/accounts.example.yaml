@@ -1,0 +1,7 @@
+accounts:
+  - account_name: main_meme_account
+    ig_user_id: "17841400000000000"
+    access_token_env_var: MAIN_MEME_IG_ACCESS_TOKEN
+    default_caption_template: "Day {day_number} of posting this meme"
+    default_hashtags: "#meme #daily"
+    timezone: America/Los_Angeles

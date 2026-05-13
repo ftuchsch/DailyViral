@@ -1,0 +1,7 @@
+.env
+__pycache__/
+*.pyc
+
+config/accounts.yaml
+data/posts.sqlite
+logs/dailyviral.log
