@@ -53,12 +53,16 @@ dailyviral/
   config.py
   instagram.py
   queue.py
+  r2_upload.py
   url_validation.py
+  video_overlay.py
 config/
   accounts.example.yaml
+  overlay_messages.csv
 data/
   new_post.example.json
   posts.sqlite
+generated/
 logs/
 .env.example
 README.md
@@ -357,6 +361,11 @@ In GitHub repo settings, create repository secrets:
 - `DAILYVIRAL_VIDEO_URL`
 - `IG_USER_ID`
 - `INSTAGRAM_USERNAME`
+- `R2_ACCESS_KEY_ID`
+- `R2_SECRET_ACCESS_KEY`
+- `R2_ACCOUNT_ID`
+- `R2_BUCKET_NAME`
+- `R2_PUBLIC_BASE_URL`
 
 Step 3:
 Create repository variables:
@@ -367,6 +376,7 @@ Create repository variables:
 - `DAILYVIRAL_TIMEZONE`
 - `DAILYVIRAL_CAPTION_TEMPLATE`
 - `DAILYVIRAL_HASHTAGS`
+- `ENABLE_VIDEO_OVERLAY`
 
 Example variables:
 
@@ -377,6 +387,7 @@ DRY_RUN=false
 DAILYVIRAL_TIMEZONE=America/Los_Angeles
 DAILYVIRAL_CAPTION_TEMPLATE=Day {day_number} of posting this meme
 DAILYVIRAL_HASHTAGS=#meme #reels #daily
+ENABLE_VIDEO_OVERLAY=false
 ```
 
 Step 4:
@@ -409,6 +420,39 @@ This mode is stateless:
 - it computes the day number from `DAILYVIRAL_START_DATE`
 - it tries to avoid duplicate posts by checking recent media captions through the official API
 - `--force` bypasses that duplicate-caption check for manual reruns
+
+## Daily Video Text Overlay
+
+If you want GitHub Actions to generate a new video every day before posting, enable overlay mode.
+
+Create Cloudflare R2 write credentials and add these GitHub repository secrets:
+
+- `R2_ACCESS_KEY_ID`
+- `R2_SECRET_ACCESS_KEY`
+- `R2_ACCOUNT_ID`
+- `R2_BUCKET_NAME`
+- `R2_PUBLIC_BASE_URL`
+
+Add this GitHub repository variable:
+
+- `ENABLE_VIDEO_OVERLAY=true`
+
+Overlay messages live in `config/overlay_messages.csv`.
+
+The messages cycle every 15 days:
+
+- Day 1 uses row 1
+- Day 15 uses row 15
+- Day 16 loops back to row 1
+
+When `ENABLE_VIDEO_OVERLAY=true`, GitHub Actions will:
+
+1. download the base video from `DAILYVIRAL_VIDEO_URL`
+2. burn in the daily white text message near the bottom-right with an ffmpeg overlay
+3. upload the generated MP4 to Cloudflare R2
+4. post the generated R2 public URL to Instagram through the official API flow
+
+When `ENABLE_VIDEO_OVERLAY=false`, DailyViral keeps the previous behavior and posts `DAILYVIRAL_VIDEO_URL` directly.
 
 ## Status And Analytics
 

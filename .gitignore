@@ -7,3 +7,4 @@ data/posts.sqlite
 data/launchd/
 logs/
 *.log
+generated/

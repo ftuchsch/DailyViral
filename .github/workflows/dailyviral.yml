@@ -43,6 +43,8 @@ jobs:
 
       - name: Install dependencies
         run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
@@ -58,6 +60,12 @@ jobs:
           DAILYVIRAL_CAPTION_TEMPLATE: ${{ vars.DAILYVIRAL_CAPTION_TEMPLATE }}
           DAILYVIRAL_HASHTAGS: ${{ vars.DAILYVIRAL_HASHTAGS }}
           DAILYVIRAL_TIMEZONE: ${{ vars.DAILYVIRAL_TIMEZONE }}
+          ENABLE_VIDEO_OVERLAY: ${{ vars.ENABLE_VIDEO_OVERLAY || 'false' }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+          R2_PUBLIC_BASE_URL: ${{ secrets.R2_PUBLIC_BASE_URL }}
         shell: bash
         run: |
           set -euo pipefail

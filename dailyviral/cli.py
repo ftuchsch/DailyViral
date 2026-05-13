@@ -33,12 +33,20 @@ from .config import (
 )
 from .instagram import InstagramApiError, InstagramClient
 from .queue import PostRecord, QueueStore
+from .r2_upload import build_generated_object_key, load_r2_config_from_env, upload_video_to_r2
 from .url_validation import UrlValidationResult, validate_public_video_url
+from .video_overlay import (
+    build_overlay_render_plan,
+    download_video,
+    render_overlay_video,
+    select_overlay_sentence,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_GHA_CAPTION_TEMPLATE = "Day {day_number} of posting this meme"
 DEFAULT_GHA_HASHTAGS = "#meme #reels #daily"
 DEFAULT_GHA_TIMEZONE = "America/Los_Angeles"
+DEFAULT_GHA_ENABLE_VIDEO_OVERLAY = "false"
 REQUIRED_CHECK_ENV_VARS = (
     "AUTO_POST_ENABLED",
     "DRY_RUN",
@@ -690,10 +698,27 @@ def handle_gha_post_daily(
         caption=day_caption,
         hashtags=env_values["hashtags"],
     )
+    overlay_enabled = _env_flag(env_values["enable_video_overlay"])
+    overlay_sentence = None
+    if overlay_enabled:
+        overlay_sentence = select_overlay_sentence(
+            day_number=day_number,
+            csv_path=PROJECT_ROOT / "config" / "overlay_messages.csv",
+        )
+
+    base_video_url = env_values["video_url"]
     validation = validate_public_video_url(
-        env_values["video_url"],
+        base_video_url,
         timeout_seconds=settings.http_timeout_seconds,
     )
+    planned_generated_url = None
+    if overlay_enabled:
+        planned_generated_url = (
+            f"{getenv_stripped('R2_PUBLIC_BASE_URL').rstrip('/')}/"
+            f"{build_generated_object_key(day_number=day_number, local_date=local_today)}"
+            if getenv_stripped("R2_PUBLIC_BASE_URL")
+            else "<R2_PUBLIC_BASE_URL>/generated/day-<N>-YYYY-MM-DD.mp4"
+        )
 
     print("GitHub Actions daily post")
     print(f"  Account: {account.account_name}")
@@ -701,7 +726,12 @@ def handle_gha_post_daily(
     print(f"  Day number: {day_number}")
     print(f"  Instagram username: {account.instagram_username}")
     print(f"  IG User ID: {account.ig_user_id}")
-    print(f"  Video URL: {env_values['video_url']}")
+    print(f"  Base video URL: {base_video_url}")
+    print(f"  ENABLE_VIDEO_OVERLAY: {str(overlay_enabled).lower()}")
+    if overlay_sentence:
+        print(f"  Overlay sentence: {overlay_sentence}")
+    if overlay_enabled:
+        print(f"  Planned generated URL: {planned_generated_url}")
     print(f"  Final caption: {final_caption}")
     print(f"  INSTAGRAM_ACCESS_TOKEN: {mask_secret(_require_env_value('INSTAGRAM_ACCESS_TOKEN'))}")
     print(f"  AUTO_POST_ENABLED: {str(settings.auto_post_enabled).lower()}")
@@ -713,9 +743,13 @@ def handle_gha_post_daily(
 
     if not settings.auto_post_enabled:
         print("AUTO_POST_ENABLED is not true. Dry-run only; skipping publish.")
+        if overlay_enabled:
+            print("Overlay mode dry run: would render a generated MP4, skip the R2 upload, and skip the Instagram publish.")
         return 0
     if settings.dry_run:
         print("DRY_RUN is true. Dry-run only; skipping publish.")
+        if overlay_enabled:
+            print("Overlay mode dry run: would render a generated MP4, skip the R2 upload, and skip the Instagram publish.")
         return 0
 
     client = InstagramClient(settings, logger=logger)
@@ -731,21 +765,52 @@ def handle_gha_post_daily(
     if recent_media_result == "cannot-check":
         return 1
 
+    post_video_url = base_video_url
+    if overlay_enabled:
+        r2_config = load_r2_config_from_env()
+        object_key = build_generated_object_key(day_number=day_number, local_date=local_today)
+        render_plan = build_overlay_render_plan(
+            day_number=day_number,
+            local_date=local_today,
+            output_root=PROJECT_ROOT / "generated",
+            overlay_sentence=overlay_sentence or "",
+        )
+        logger.info(
+            "GitHub Actions overlay render starting account=%s day_number=%s base_video_url=%s object_key=%s overlay=%s",
+            account.account_name,
+            day_number,
+            base_video_url,
+            object_key,
+            overlay_sentence,
+        )
+        download_video(
+            url=base_video_url,
+            destination=render_plan.downloaded_video_path,
+            timeout_seconds=settings.http_timeout_seconds,
+        )
+        rendered_path = render_overlay_video(plan=render_plan)
+        post_video_url = upload_video_to_r2(
+            file_path=rendered_path,
+            object_key=object_key,
+            config=r2_config,
+        )
+        print(f"  Generated video URL: {post_video_url}")
+
     try:
         logger.info(
             "GitHub Actions posting account=%s date=%s day_number=%s video_url=%s caption=%s",
             account.account_name,
             local_today.isoformat(),
             day_number,
-            env_values["video_url"],
+            post_video_url,
             final_caption,
         )
         result = client.publish_reel(
             account=account,
-            video_url=env_values["video_url"],
+            video_url=post_video_url,
             caption=final_caption,
         )
-    except InstagramApiError as exc:
+    except (ConfigurationError, InstagramApiError) as exc:
         logger.error(
             "GitHub Actions posting failed account=%s date=%s error=%s",
             account.account_name,
@@ -1198,6 +1263,7 @@ def load_gha_env_values() -> dict[str, str]:
     values["caption_template"] = getenv_stripped("DAILYVIRAL_CAPTION_TEMPLATE") or DEFAULT_GHA_CAPTION_TEMPLATE
     values["hashtags"] = getenv_stripped("DAILYVIRAL_HASHTAGS") or DEFAULT_GHA_HASHTAGS
     values["timezone"] = getenv_stripped("DAILYVIRAL_TIMEZONE") or DEFAULT_GHA_TIMEZONE
+    values["enable_video_overlay"] = getenv_stripped("ENABLE_VIDEO_OVERLAY") or DEFAULT_GHA_ENABLE_VIDEO_OVERLAY
     values["start_date"] = _validate_date_string(values["DAILYVIRAL_START_DATE"])
     values["video_url"] = values["DAILYVIRAL_VIDEO_URL"]
     return values
@@ -1264,6 +1330,10 @@ def _require_env_value(name: str) -> str:
     if value:
         return value
     raise ConfigurationError(f"Environment variable '{name}' is required but not set.")
+
+
+def _env_flag(value: str) -> bool:
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _print_report_line(passed: bool, label: str, detail: str) -> None:
