@@ -242,7 +242,7 @@ class InstagramClient:
         params: dict[str, Any] | None = None,
         data: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        url = f"https://graph.facebook.com/{self.settings.graph_api_version}{path}"
+        url = f"{self.settings.graph_api_base_url}/{self.settings.graph_api_version}{path}"
         request_params = dict(params or {})
         request_data = dict(data or {})
         if method.upper() == "POST":

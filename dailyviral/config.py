@@ -28,10 +28,12 @@ class ConfigurationError(RuntimeError):
 @dataclass(slots=True)
 class AccountConfig:
     account_name: str
+    instagram_username: str
     ig_user_id: str
     access_token_env_var: str
     default_caption_template: str = ""
     default_hashtags: str = ""
+    required_hashtags: str = ""
     timezone: str = "UTC"
 
 
@@ -40,6 +42,7 @@ class AppSettings:
     auto_post_enabled: bool
     confirm_before_posting: bool
     dry_run: bool
+    graph_api_base_url: str
     graph_api_version: str
     publishing_limit_buffer: int
     http_timeout_seconds: int
@@ -79,6 +82,10 @@ def load_config(
         auto_post_enabled=_env_bool("AUTO_POST_ENABLED", default=False),
         confirm_before_posting=_env_bool("CONFIRM_BEFORE_POSTING", default=True),
         dry_run=_env_bool("DRY_RUN", default=False),
+        graph_api_base_url=os.getenv(
+            "GRAPH_API_BASE_URL",
+            "https://graph.instagram.com",
+        ).rstrip("/"),
         graph_api_version=os.getenv("GRAPH_API_VERSION", "v23.0"),
         publishing_limit_buffer=_env_int("PUBLISHING_LIMIT_BUFFER", default=1),
         http_timeout_seconds=_env_int("HTTP_TIMEOUT_SECONDS", default=20),
@@ -156,12 +163,49 @@ def setup_logging(log_path: Path) -> logging.Logger:
 
 
 def require_access_token(account: AccountConfig) -> str:
-    token = os.getenv(account.access_token_env_var, "").strip()
+    token = getenv_stripped(account.access_token_env_var)
     if token:
         return token
     raise ConfigurationError(
         f"Environment variable '{account.access_token_env_var}' is not set."
     )
+
+
+def getenv_stripped(name: str) -> str:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return ""
+    return raw_value.strip()
+
+
+def env_var_is_set(name: str) -> bool:
+    return bool(getenv_stripped(name))
+
+
+def mask_secret(value: str, *, prefix: int = 6, suffix: int = 4) -> str:
+    if not value:
+        return "<not set>"
+    if len(value) <= prefix + suffix:
+        if len(value) <= 4:
+            return "*" * len(value)
+        return f"{value[:2]}...{value[-2:]}"
+    return f"{value[:prefix]}...{value[-suffix:]}"
+
+
+def is_placeholder_ig_user_id(value: str) -> bool:
+    normalized = value.strip()
+    if not normalized:
+        return True
+    if normalized in {
+        "17841400000000000",
+        "00000000000000000",
+        "1234567890",
+        "<IG_USER_ID>",
+        "replace_me",
+    }:
+        return True
+    lowered = normalized.lower()
+    return "placeholder" in lowered or "replace" in lowered
 
 
 def _load_yaml(path: Path) -> Any:
@@ -187,7 +231,7 @@ def _parse_accounts(payload: Any) -> dict[str, AccountConfig]:
         if not isinstance(raw_account, dict):
             raise ConfigurationError(f"Account entry #{index} must be a mapping.")
 
-        required = ("account_name", "ig_user_id", "access_token_env_var")
+        required = ("account_name", "instagram_username", "ig_user_id", "access_token_env_var")
         missing = [field for field in required if not str(raw_account.get(field, "")).strip()]
         if missing:
             raise ConfigurationError(
@@ -196,10 +240,12 @@ def _parse_accounts(payload: Any) -> dict[str, AccountConfig]:
 
         account = AccountConfig(
             account_name=str(raw_account["account_name"]).strip(),
+            instagram_username=str(raw_account["instagram_username"]).strip(),
             ig_user_id=str(raw_account["ig_user_id"]).strip(),
             access_token_env_var=str(raw_account["access_token_env_var"]).strip(),
             default_caption_template=str(raw_account.get("default_caption_template", "")).strip(),
             default_hashtags=str(raw_account.get("default_hashtags", "")).strip(),
+            required_hashtags=str(raw_account.get("required_hashtags", "")).strip(),
             timezone=str(raw_account.get("timezone", "UTC")).strip() or "UTC",
         )
         accounts[account.account_name] = account

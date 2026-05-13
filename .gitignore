@@ -4,4 +4,6 @@ __pycache__/
 
 config/accounts.yaml
 data/posts.sqlite
-logs/dailyviral.log
+data/launchd/
+logs/
+*.log

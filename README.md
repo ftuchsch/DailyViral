@@ -112,35 +112,45 @@ cp .env.example .env
 Important environment variables:
 
 - `AUTO_POST_ENABLED`
-  - `false` means `post-next` runs in dry-run mode only
+  - `false` means `run-due` and `post-next` run in dry-run mode only
   - `true` allows real publishing
 - `CONFIRM_BEFORE_POSTING`
   - `true` asks for confirmation before posting
 - `DRY_RUN`
   - if `true`, force dry-run mode even if auto-posting is enabled
+- `GRAPH_API_BASE_URL`
+  - defaults to `https://graph.instagram.com`
 - `GRAPH_API_VERSION`
   - defaults to `v23.0`; keep this aligned with the Meta Graph API version you use
-- `MAIN_MEME_IG_ACCESS_TOKEN`
-  - example access token env var referenced by `config/accounts.yaml`
+- `INSTAGRAM_USERNAME`
+  - your Instagram professional account username
+- `INSTAGRAM_ACCESS_TOKEN`
+  - your local access token; never commit it
+- `DAILYVIRAL_VIDEO_URL`
+  - a direct public video URL for the next local test post
 
 Configure accounts in `config/accounts.yaml`:
 
 ```yaml
 accounts:
   - account_name: main_meme_account
+    instagram_username: your_instagram_username
     ig_user_id: "17841400000000000"
-    access_token_env_var: MAIN_MEME_IG_ACCESS_TOKEN
+    access_token_env_var: INSTAGRAM_ACCESS_TOKEN
     default_caption_template: "Day {day_number} of posting this meme"
     default_hashtags: "#meme #daily"
+    required_hashtags: "#meme #daily #coach #fails #GetEmRightCoach #YouGoodCoach"
     timezone: America/Los_Angeles
 ```
 
 Notes:
 
+- `instagram_username` should match your target Instagram account.
 - `ig_user_id` is the Instagram user ID used by the Graph API.
 - `access_token_env_var` points to the environment variable name, not the token itself.
 - `default_caption_template` is optional.
 - `default_hashtags` is optional.
+- `required_hashtags` are always appended if they are missing.
 - `timezone` controls which posts are considered due on a given day for that account.
 
 ## Acceptable Video URLs
@@ -197,20 +207,47 @@ python -m dailyviral add-from-file data/new_post.example.json
 
 If `caption` is blank and the account has a template, DailyViral fills it automatically using the next day number.
 
-## Posting One Reel
-
-Dry run:
+Queue directly from your local `.env` video URL:
 
 ```bash
-python -m dailyviral post-next main_meme_account
+python -m dailyviral add-real-post main_meme_account
 ```
 
-If `AUTO_POST_ENABLED=false`, this will:
+## Posting One Reel
+
+Config and dry-run sequence:
+
+```bash
+python -m dailyviral check-config main_meme_account
+python -m dailyviral init
+python -m dailyviral add-real-post main_meme_account
+python -m dailyviral status
+python -m dailyviral dry-run main_meme_account
+```
+
+`check-config` will:
+
+- load `.env` through `python-dotenv`
+- verify required env vars exist
+- verify the selected account exists in `config/accounts.yaml`
+- verify the configured username, IG user ID, and access token env var
+- validate that `DAILYVIRAL_VIDEO_URL` is publicly reachable
+- print a pass/fail report without printing the full token
+
+Dry run command:
+
+```bash
+python -m dailyviral dry-run main_meme_account
+```
+
+Dry run will:
 
 - validate the video URL
 - prepare the final caption
-- print the exact payload it would post
+- show account name, username, IG user ID, video URL, and final caption
+- show `AUTO_POST_ENABLED` and `DRY_RUN`
 - avoid publishing anything
+- leave the post queued
 
 Force dry run explicitly:
 
@@ -220,12 +257,17 @@ python -m dailyviral post-next main_meme_account --dry-run
 
 Real publish:
 
-1. Set `AUTO_POST_ENABLED=true` in `.env`
-2. Optionally keep `CONFIRM_BEFORE_POSTING=true`
-3. Run:
+Change `.env` to:
 
 ```bash
-python -m dailyviral post-next main_meme_account
+AUTO_POST_ENABLED=true
+DRY_RUN=false
+```
+
+Then run:
+
+```bash
+python -m dailyviral post-next main_meme_account --yes
 ```
 
 The publish flow is:
@@ -238,6 +280,71 @@ The publish flow is:
 6. publish the media container
 7. fetch and store the permalink if available
 
+If `AUTO_POST_ENABLED=false` or `DRY_RUN=true`, `post-next` will not publish and will fall back to dry-run behavior instead.
+
+## Schedule 30 Days Ahead
+
+Step 1:
+Make sure `.env` has:
+
+```bash
+AUTO_POST_ENABLED=true
+DRY_RUN=false
+```
+
+Step 2:
+Queue the next 30 days:
+
+```bash
+python -m dailyviral schedule-days main_meme_account --days 30
+```
+
+Step 3:
+Inspect upcoming posts:
+
+```bash
+python -m dailyviral upcoming main_meme_account
+```
+
+Step 4:
+Test the daily runner safely by temporarily setting:
+
+```bash
+AUTO_POST_ENABLED=false
+DRY_RUN=true
+```
+
+Then run:
+
+```bash
+python -m dailyviral run-due main_meme_account --yes
+```
+
+Step 5:
+Turn real posting back on:
+
+```bash
+AUTO_POST_ENABLED=true
+DRY_RUN=false
+```
+
+Step 6:
+Install daily scheduling on macOS:
+
+```bash
+python -m dailyviral make-launchd main_meme_account --time "09:00" --install
+```
+
+Step 7:
+Verify launchd is loaded and logs are written to:
+
+```text
+logs/launchd.out.log
+logs/launchd.err.log
+```
+
+The Mac must be awake and connected to the internet when the scheduled job runs.
+
 ## Status And Analytics
 
 Queue overview:
@@ -245,6 +352,18 @@ Queue overview:
 ```bash
 python -m dailyviral status
 python -m dailyviral status --account-name main_meme_account
+```
+
+Upcoming queue:
+
+```bash
+python -m dailyviral upcoming main_meme_account
+```
+
+Recent posted posts:
+
+```bash
+python -m dailyviral posted main_meme_account
 ```
 
 Local queue analytics:
@@ -273,12 +392,22 @@ Each publish attempt is logged with:
 
 ## Scheduling Later
 
-This MVP is designed so you can run it from cron, GitHub Actions, or a small server later.
-
 Cron example:
 
 ```bash
-0 9 * * * cd /path/to/DailyViral && /path/to/.venv/bin/python -m dailyviral post-next main_meme_account
+python -m dailyviral make-cron main_meme_account --time "09:00"
+```
+
+macOS launchd generation:
+
+```bash
+python -m dailyviral make-launchd main_meme_account --time "09:00"
+```
+
+The daily runner command is:
+
+```bash
+python -m dailyviral run-due main_meme_account --yes
 ```
 
 GitHub Actions later:
@@ -286,7 +415,7 @@ GitHub Actions later:
 - check out the repo
 - install Python dependencies
 - provide `.env` values through GitHub Actions secrets
-- run `python -m dailyviral post-next main_meme_account`
+- run `python -m dailyviral run-due main_meme_account --yes`
 
 ## Warnings
 

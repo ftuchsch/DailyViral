@@ -1,7 +1,9 @@
 accounts:
   - account_name: main_meme_account
+    instagram_username: your_instagram_username
     ig_user_id: "17841400000000000"
-    access_token_env_var: MAIN_MEME_IG_ACCESS_TOKEN
+    access_token_env_var: INSTAGRAM_ACCESS_TOKEN
     default_caption_template: "Day {day_number} of posting this meme"
     default_hashtags: "#meme #daily"
+    required_hashtags: "#meme #daily #coach #fails #GetEmRightCoach #YouGoodCoach"
     timezone: America/Los_Angeles

@@ -22,7 +22,10 @@ def prepare_new_post(
     hashtags: str,
 ) -> CaptionResolution:
     clean_caption = caption.strip()
-    clean_hashtags = hashtags.strip() or account.default_hashtags.strip()
+    clean_hashtags = _merge_required_hashtags(
+        hashtags.strip() or account.default_hashtags.strip(),
+        account.required_hashtags,
+    )
     day_number: int | None = None
 
     if not clean_caption and account.default_caption_template.strip():
@@ -45,7 +48,10 @@ def resolve_caption(
     queue_store: QueueStore,
 ) -> CaptionResolution:
     caption = post.caption.strip()
-    hashtags = post.hashtags.strip() or account.default_hashtags.strip()
+    hashtags = _merge_required_hashtags(
+        post.hashtags.strip() or account.default_hashtags.strip(),
+        account.required_hashtags,
+    )
     day_number: int | None = None
 
     if not caption and account.default_caption_template.strip():
@@ -72,3 +78,20 @@ def compose_caption(*, caption: str, hashtags: str) -> str:
 
 def infer_next_day_number(queue_store: QueueStore, account_name: str) -> int:
     return queue_store.count_posts_for_day_number(account_name) + 1
+
+
+def _merge_required_hashtags(current_hashtags: str, required_hashtags: str) -> str:
+    ordered_tags: list[str] = []
+    seen: set[str] = set()
+
+    for raw_group in (current_hashtags, required_hashtags):
+        for token in raw_group.split():
+            if not token:
+                continue
+            normalized = token.lower()
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            ordered_tags.append(token)
+
+    return " ".join(ordered_tags)

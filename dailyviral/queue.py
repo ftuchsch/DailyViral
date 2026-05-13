@@ -115,19 +115,31 @@ class QueueStore:
             raise KeyError(f"Post {post_id} was not found.")
         return _row_to_post(row)
 
-    def get_next_post(self, account_name: str, *, on_or_before: str) -> PostRecord | None:
+    def get_next_post(
+        self,
+        account_name: str,
+        *,
+        on_or_before: str,
+        statuses: tuple[str, ...] = ("queued", "ready"),
+    ) -> PostRecord | None:
+        if not statuses:
+            raise ValueError("At least one queue status must be provided.")
+        for status in statuses:
+            self._validate_status(status)
+
+        placeholders = ", ".join("?" for _ in statuses)
         with self.connection() as conn:
             row = conn.execute(
-                """
+                f"""
                 SELECT *
                 FROM posts
                 WHERE account_name = ?
                   AND scheduled_date <= ?
-                  AND status IN ('queued', 'ready')
+                  AND status IN ({placeholders})
                 ORDER BY scheduled_date ASC, created_at ASC, id ASC
                 LIMIT 1
                 """,
-                (account_name, on_or_before),
+                (account_name, on_or_before, *statuses),
             ).fetchone()
         return _row_to_post(row) if row else None
 
@@ -205,6 +217,144 @@ class QueueStore:
                 (account_name,),
             ).fetchone()
         return int(row["count"])
+
+    def count_posts_by_status(
+        self,
+        account_name: str,
+        *,
+        statuses: tuple[str, ...],
+    ) -> int:
+        if not statuses:
+            return 0
+        for status in statuses:
+            self._validate_status(status)
+
+        placeholders = ", ".join("?" for _ in statuses)
+        with self.connection() as conn:
+            row = conn.execute(
+                f"""
+                SELECT COUNT(*) AS count
+                FROM posts
+                WHERE account_name = ?
+                  AND status IN ({placeholders})
+                """,
+                (account_name, *statuses),
+            ).fetchone()
+        return int(row["count"])
+
+    def scheduled_date_exists(self, account_name: str, scheduled_date: str) -> bool:
+        with self.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM posts
+                WHERE account_name = ?
+                  AND scheduled_date = ?
+                LIMIT 1
+                """,
+                (account_name, scheduled_date),
+            ).fetchone()
+        return row is not None
+
+    def latest_scheduled_date(
+        self,
+        account_name: str,
+        *,
+        statuses: tuple[str, ...] | None = None,
+        scheduled_after: str | None = None,
+    ) -> str | None:
+        params: list[Any] = [account_name]
+        query = """
+            SELECT scheduled_date
+            FROM posts
+            WHERE account_name = ?
+        """
+
+        if statuses:
+            for status in statuses:
+                self._validate_status(status)
+            placeholders = ", ".join("?" for _ in statuses)
+            query += f" AND status IN ({placeholders})"
+            params.extend(statuses)
+
+        if scheduled_after is not None:
+            query += " AND scheduled_date > ?"
+            params.append(scheduled_after)
+
+        query += " ORDER BY scheduled_date DESC, id DESC LIMIT 1"
+
+        with self.connection() as conn:
+            row = conn.execute(query, tuple(params)).fetchone()
+        return str(row["scheduled_date"]) if row else None
+
+    def upcoming_posts(
+        self,
+        account_name: str,
+        *,
+        limit: int = 10,
+        scheduled_on_or_after: str | None = None,
+        statuses: tuple[str, ...] = ("queued", "ready"),
+    ) -> list[PostRecord]:
+        if not statuses:
+            return []
+        for status in statuses:
+            self._validate_status(status)
+
+        placeholders = ", ".join("?" for _ in statuses)
+        params: list[Any] = [account_name, *statuses]
+        query = f"""
+            SELECT *
+            FROM posts
+            WHERE account_name = ?
+              AND status IN ({placeholders})
+        """
+        if scheduled_on_or_after is not None:
+            query += " AND scheduled_date >= ?"
+            params.append(scheduled_on_or_after)
+
+        query += " ORDER BY scheduled_date ASC, created_at ASC, id ASC LIMIT ?"
+        params.append(limit)
+
+        with self.connection() as conn:
+            rows = conn.execute(query, tuple(params)).fetchall()
+        return [_row_to_post(row) for row in rows]
+
+    def recent_posted_posts(self, account_name: str, *, limit: int = 10) -> list[PostRecord]:
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM posts
+                WHERE account_name = ?
+                  AND status = 'posted'
+                ORDER BY posted_at DESC, id DESC
+                LIMIT ?
+                """,
+                (account_name, limit),
+            ).fetchall()
+        return [_row_to_post(row) for row in rows]
+
+    def has_posted_between(
+        self,
+        account_name: str,
+        *,
+        start_posted_at: str,
+        end_posted_at: str,
+    ) -> bool:
+        with self.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM posts
+                WHERE account_name = ?
+                  AND status = 'posted'
+                  AND posted_at >= ?
+                  AND posted_at < ?
+                LIMIT 1
+                """,
+                (account_name, start_posted_at, end_posted_at),
+            ).fetchone()
+        return row is not None
 
     def status_counts(self, *, account_name: str | None = None) -> dict[str, int]:
         query = """
