@@ -64,9 +64,7 @@ class QueueStore:
                 "CREATE INDEX IF NOT EXISTS idx_posts_account_schedule_status "
                 "ON posts(account_name, scheduled_date, status)"
             )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_posts_status ON posts(status)"
-            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_status ON posts(status)")
             conn.commit()
 
     def add_post(
@@ -165,6 +163,9 @@ class QueueStore:
         if "status" in fields:
             self._validate_status(str(fields["status"]))
 
+        allowed = set(PostRecord.__dataclass_fields__) - {"id", "created_at"}
+        if fields.keys() - allowed:
+            raise ValueError("Queue update contains an unsupported field.")
         columns = ", ".join(f"{key} = ?" for key in fields)
         values = list(fields.values()) + [post_id]
         with self.connection() as conn:
@@ -392,7 +393,9 @@ class QueueStore:
             for row in rows
         ]
 
-    def recent_failures(self, *, account_name: str | None = None, limit: int = 5) -> list[PostRecord]:
+    def recent_failures(
+        self, *, account_name: str | None = None, limit: int = 5
+    ) -> list[PostRecord]:
         query = "SELECT * FROM posts WHERE status = 'failed'"
         params: tuple[Any, ...]
         if account_name:
@@ -407,7 +410,9 @@ class QueueStore:
             rows = conn.execute(query, params).fetchall()
         return [_row_to_post(row) for row in rows]
 
-    def recent_successes(self, *, account_name: str | None = None, limit: int = 5) -> list[PostRecord]:
+    def recent_successes(
+        self, *, account_name: str | None = None, limit: int = 5
+    ) -> list[PostRecord]:
         query = "SELECT * FROM posts WHERE status = 'posted'"
         params: tuple[Any, ...]
         if account_name:
@@ -456,9 +461,7 @@ def _row_to_post(row: sqlite3.Row | None) -> PostRecord:
         if row["instagram_creation_id"]
         else None,
         instagram_media_id=str(row["instagram_media_id"]) if row["instagram_media_id"] else None,
-        instagram_permalink=str(row["instagram_permalink"])
-        if row["instagram_permalink"]
-        else None,
+        instagram_permalink=str(row["instagram_permalink"]) if row["instagram_permalink"] else None,
         error_message=str(row["error_message"]) if row["error_message"] else None,
     )
 

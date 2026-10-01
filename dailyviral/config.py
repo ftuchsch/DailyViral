@@ -10,6 +10,8 @@ from typing import Any
 import yaml
 from dotenv import load_dotenv
 
+from .security import RedactingFilter
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_DIR = PROJECT_ROOT / "config"
 DATA_DIR = PROJECT_ROOT / "data"
@@ -104,9 +106,7 @@ def load_config(
         )
 
     if require_accounts and not accounts:
-        raise ConfigurationError(
-            "No Instagram accounts configured in config/accounts.yaml."
-        )
+        raise ConfigurationError("No Instagram accounts configured in config/accounts.yaml.")
 
     return AppConfig(settings=settings, accounts=accounts)
 
@@ -155,6 +155,8 @@ def setup_logging(log_path: Path) -> logging.Logger:
 
     stream_handler = logging.StreamHandler()
     stream_handler.setFormatter(formatter)
+    file_handler.addFilter(RedactingFilter())
+    stream_handler.addFilter(RedactingFilter())
 
     logger.addHandler(file_handler)
     logger.addHandler(stream_handler)
@@ -166,9 +168,7 @@ def require_access_token(account: AccountConfig) -> str:
     token = getenv_stripped(account.access_token_env_var)
     if token:
         return token
-    raise ConfigurationError(
-        f"Environment variable '{account.access_token_env_var}' is not set."
-    )
+    raise ConfigurationError(f"Environment variable '{account.access_token_env_var}' is not set.")
 
 
 def getenv_stripped(name: str) -> str:
@@ -182,14 +182,11 @@ def env_var_is_set(name: str) -> bool:
     return bool(getenv_stripped(name))
 
 
-def mask_secret(value: str, *, prefix: int = 6, suffix: int = 4) -> str:
+def mask_secret(value: str) -> str:
+    """Show whether a secret exists without exposing any of its characters."""
     if not value:
         return "<not set>"
-    if len(value) <= prefix + suffix:
-        if len(value) <= 4:
-            return "*" * len(value)
-        return f"{value[:2]}...{value[-2:]}"
-    return f"{value[:prefix]}...{value[-suffix:]}"
+    return "[redacted]"
 
 
 def is_placeholder_ig_user_id(value: str) -> bool:
@@ -212,8 +209,8 @@ def _load_yaml(path: Path) -> Any:
     try:
         with path.open("r", encoding="utf-8") as handle:
             return yaml.safe_load(handle) or {}
-    except yaml.YAMLError as exc:
-        raise ConfigurationError(f"Invalid YAML in {path}: {exc}") from exc
+    except yaml.YAMLError:
+        raise ConfigurationError(f"Invalid YAML in {path}.") from None
 
 
 def _parse_accounts(payload: Any) -> dict[str, AccountConfig]:
@@ -263,9 +260,7 @@ def _env_bool(name: str, *, default: bool) -> bool:
         return True
     if normalized in {"0", "false", "no", "off"}:
         return False
-    raise ConfigurationError(
-        f"Environment variable {name} must be true/false, got '{raw_value}'."
-    )
+    raise ConfigurationError(f"Environment variable {name} must be true/false.")
 
 
 def _env_int(name: str, *, default: int) -> int:
@@ -275,6 +270,4 @@ def _env_int(name: str, *, default: int) -> int:
     try:
         return int(raw_value)
     except ValueError as exc:
-        raise ConfigurationError(
-            f"Environment variable {name} must be an integer, got '{raw_value}'."
-        ) from exc
+        raise ConfigurationError(f"Environment variable {name} must be an integer.") from exc

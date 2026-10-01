@@ -1,27 +1,26 @@
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
 import logging
 import os
 import plistlib
-import re
 import shlex
 import shutil
 import subprocess
 import sys
 from dataclasses import asdict, dataclass
-from datetime import date, datetime, time as datetime_time, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from datetime import time as datetime_time
 from pathlib import Path
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from zoneinfo import ZoneInfo
 
 from . import __version__
 from .analytics import build_report
-from .captions import CaptionResolution, compose_caption, prepare_new_post, resolve_caption
+from .captions import CaptionResolution, prepare_new_post, resolve_caption
 from .config import (
-    AccountConfig,
     DEFAULT_ACCOUNTS_PATH,
+    AccountConfig,
     AppConfig,
     AppSettings,
     ConfigurationError,
@@ -30,28 +29,26 @@ from .config import (
     getenv_stripped,
     is_placeholder_ig_user_id,
     load_config,
-    mask_secret,
     setup_logging,
 )
-from .instagram import InstagramApiError, InstagramClient
-from .queue import PostRecord, QueueStore
-from .r2_upload import build_generated_object_key, load_r2_config_from_env, upload_video_to_r2
-from .url_validation import UrlValidationResult, validate_public_video_url
-from .video_overlay import (
-    build_overlay_render_plan,
-    download_video,
-    load_overlay_messages,
-    render_overlay_video,
-    select_overlay_sentence,
+from .gha import handle_gha_post_daily, handle_gha_schedule_readiness
+from .instagram import (
+    InstagramApiError,
+    InstagramClient,
 )
+from .queue import PostRecord, QueueStore
+from .runtime import (
+    assert_account_publish_config,
+    current_local_date,
+    parse_date,
+    require_env_value,
+    today_in_timezone,
+    validate_date_string,
+)
+from .security import redact_sensitive
+from .url_validation import UrlValidationResult, validate_public_video_url
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_GHA_CAPTION_TEMPLATE = "Day {day_number} of posting this meme"
-DEFAULT_GHA_HASHTAGS = "#meme #reels #daily"
-DEFAULT_GHA_TIMEZONE = "America/Los_Angeles"
-DEFAULT_GHA_ENABLE_VIDEO_OVERLAY = "false"
-DEFAULT_GHA_SCHEDULE_CRON = "17 16 * * *"
-WORKFLOW_PATH = PROJECT_ROOT / ".github" / "workflows" / "dailyviral.yml"
 REQUIRED_CHECK_ENV_VARS = (
     "AUTO_POST_ENABLED",
     "DRY_RUN",
@@ -73,20 +70,6 @@ ACCOUNT_REQUIRED_COMMANDS = {
     "schedule-days",
     "upcoming",
 }
-GHA_DAILY_REQUIRED_ENV_VARS = (
-    "INSTAGRAM_ACCESS_TOKEN",
-    "DAILYVIRAL_VIDEO_URL",
-    "IG_USER_ID",
-    "INSTAGRAM_USERNAME",
-    "DAILYVIRAL_START_DATE",
-)
-R2_REQUIRED_ENV_VARS = (
-    "R2_ACCESS_KEY_ID",
-    "R2_SECRET_ACCESS_KEY",
-    "R2_ACCOUNT_ID",
-    "R2_BUCKET_NAME",
-    "R2_PUBLIC_BASE_URL",
-)
 
 
 @dataclass(slots=True)
@@ -153,20 +136,22 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigurationError as exc:
         if logger:
             logger.error(str(exc))
-        print(f"Configuration error: {exc}")
+        print(f"Configuration error: {redact_sensitive(exc)}")
         return 1
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m dailyviral",
-        description="DailyViral MVP for queueing and posting Instagram Reels via the official Meta Graph API.",
+        description="Schedule and publish Instagram Reels through the official Meta API.",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
 
     subparsers = parser.add_subparsers(dest="command")
 
-    subparsers.add_parser("init", help="Create local config/data/log paths and initialize the project.")
+    subparsers.add_parser(
+        "init", help="Create local config/data/log paths and initialize the project."
+    )
 
     check_parser = subparsers.add_parser(
         "check-config",
@@ -214,7 +199,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_due_parser.add_argument("account_name")
     run_due_parser.add_argument("--yes", action="store_true", help="Skip interactive confirmation.")
-    run_due_parser.add_argument("--force", action="store_true", help="Allow another post even if one already succeeded today.")
+    run_due_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Allow another post even if one already succeeded today.",
+    )
 
     post_parser = subparsers.add_parser(
         "post-next",
@@ -223,7 +212,11 @@ def build_parser() -> argparse.ArgumentParser:
     post_parser.add_argument("account_name")
     post_parser.add_argument("--dry-run", action="store_true")
     post_parser.add_argument("--yes", action="store_true", help="Skip interactive confirmation.")
-    post_parser.add_argument("--force", action="store_true", help="Allow another post even if one already succeeded today.")
+    post_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Allow another post even if one already succeeded today.",
+    )
 
     status_parser = subparsers.add_parser("status", help="Show queue status and recent posts.")
     status_parser.add_argument("--account-name")
@@ -269,7 +262,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Stateless GitHub Actions daily posting mode using env vars only.",
     )
     gha_parser.add_argument("account_name")
-    gha_parser.add_argument("--force", action="store_true", help="Bypass recent-caption duplicate checks.")
+    gha_parser.add_argument(
+        "--force", action="store_true", help="Bypass recent-caption duplicate checks."
+    )
 
     readiness_parser = subparsers.add_parser(
         "gha-schedule-readiness",
@@ -323,7 +318,11 @@ def handle_check_config(args: argparse.Namespace, config: AppConfig) -> int:
     )
     checks.append(
         (
-            bool(account.instagram_username and env_username and account.instagram_username == env_username),
+            bool(
+                account.instagram_username
+                and env_username
+                and account.instagram_username == env_username
+            ),
             "Account username matches INSTAGRAM_USERNAME",
             f"config={account.instagram_username or '<missing>'}, env={env_username or '<missing>'}",
         )
@@ -358,7 +357,9 @@ def handle_check_config(args: argparse.Namespace, config: AppConfig) -> int:
             dailyviral_video_url,
             timeout_seconds=config.settings.http_timeout_seconds,
         )
-        checks.append((validation.ok, "DAILYVIRAL_VIDEO_URL is publicly reachable", validation.message))
+        checks.append(
+            (validation.ok, "DAILYVIRAL_VIDEO_URL is publicly reachable", validation.message)
+        )
     else:
         checks.append((False, "DAILYVIRAL_VIDEO_URL is publicly reachable", "missing"))
 
@@ -368,7 +369,6 @@ def handle_check_config(args: argparse.Namespace, config: AppConfig) -> int:
     print()
     print("Environment")
     print(f"  INSTAGRAM_ACCESS_TOKEN is set: {'yes' if bool(access_token_value) else 'no'}")
-    print(f"  Token preview: {mask_secret(access_token_value)}")
     print(f"  AUTO_POST_ENABLED: {getenv_stripped('AUTO_POST_ENABLED') or '<missing>'}")
     print(f"  DRY_RUN: {getenv_stripped('DRY_RUN') or '<missing>'}")
     print()
@@ -379,7 +379,7 @@ def handle_check_config(args: argparse.Namespace, config: AppConfig) -> int:
     if validation and validation.final_url:
         print()
         print("Video URL")
-        print(f"  Final URL: {validation.final_url}")
+        print("  Final URL: [redacted]")
         print(f"  HTTP status: {validation.http_status}")
         print(f"  Content-Type: {validation.content_type or '<unknown>'}")
         if validation.warnings:
@@ -426,7 +426,7 @@ def handle_add(args: argparse.Namespace, config: AppConfig, queue_store: QueueSt
     )
 
     if not scheduled_date:
-        scheduled_date = _today_in_timezone(account.timezone)
+        scheduled_date = today_in_timezone(account.timezone)
 
     prepared = prepare_new_post(
         account=account,
@@ -439,22 +439,24 @@ def handle_add(args: argparse.Namespace, config: AppConfig, queue_store: QueueSt
         video_url=video_url,
         caption=prepared.caption,
         hashtags=prepared.hashtags,
-        scheduled_date=_validate_date_string(scheduled_date),
+        scheduled_date=validate_date_string(scheduled_date),
     )
     print(f"Queued post #{post.id} for {post.account_name} on {post.scheduled_date}.")
     return 0
 
 
-def handle_add_real_post(args: argparse.Namespace, config: AppConfig, queue_store: QueueStore) -> int:
+def handle_add_real_post(
+    args: argparse.Namespace, config: AppConfig, queue_store: QueueStore
+) -> int:
     account = config.get_account(args.account_name)
-    _assert_account_publish_config(account)
+    assert_account_publish_config(account)
 
-    video_url = _require_env_value("DAILYVIRAL_VIDEO_URL")
-    _require_env_value(account.access_token_env_var)
+    video_url = require_env_value("DAILYVIRAL_VIDEO_URL")
+    require_env_value(account.access_token_env_var)
     scheduled_date = (
-        _validate_date_string(args.scheduled_date)
+        validate_date_string(args.scheduled_date)
         if args.scheduled_date
-        else _today_in_timezone(account.timezone)
+        else today_in_timezone(account.timezone)
     )
     prepared = prepare_new_post(
         account=account,
@@ -476,7 +478,9 @@ def handle_add_real_post(args: argparse.Namespace, config: AppConfig, queue_stor
     return 0
 
 
-def handle_add_from_file(args: argparse.Namespace, config: AppConfig, queue_store: QueueStore) -> int:
+def handle_add_from_file(
+    args: argparse.Namespace, config: AppConfig, queue_store: QueueStore
+) -> int:
     input_path = Path(args.path)
     with input_path.open("r", encoding="utf-8") as handle:
         payload = json.load(handle)
@@ -494,22 +498,24 @@ def handle_add_from_file(args: argparse.Namespace, config: AppConfig, queue_stor
         video_url=str(payload["video_url"]).strip(),
         caption=prepared.caption,
         hashtags=prepared.hashtags,
-        scheduled_date=_validate_date_string(str(payload["scheduled_date"]).strip()),
+        scheduled_date=validate_date_string(str(payload["scheduled_date"]).strip()),
     )
     print(f"Queued post #{post.id} from {input_path}.")
     return 0
 
 
-def handle_schedule_days(args: argparse.Namespace, config: AppConfig, queue_store: QueueStore) -> int:
+def handle_schedule_days(
+    args: argparse.Namespace, config: AppConfig, queue_store: QueueStore
+) -> int:
     account = config.get_account(args.account_name)
-    _assert_account_publish_config(account)
+    assert_account_publish_config(account)
 
     created = schedule_days_for_account(
         account=account,
         queue_store=queue_store,
         days=args.days,
         start_date=args.start_date,
-        video_url=_require_env_value("DAILYVIRAL_VIDEO_URL"),
+        video_url=require_env_value("DAILYVIRAL_VIDEO_URL"),
     )
 
     print(f"Created {len(created)} queued posts for {account.account_name}.")
@@ -577,7 +583,7 @@ def handle_status(args: argparse.Namespace, queue_store: QueueStore) -> int:
         for post in posts:
             summary = (
                 f"#{post.id} | {post.account_name} | {post.scheduled_date} | "
-                f"{post.status} | {post.video_url}"
+                f"{post.status} | [video URL redacted]"
             )
             print(summary)
             if post.error_message:
@@ -697,312 +703,6 @@ def handle_make_cron(args: argparse.Namespace, config: AppConfig) -> int:
     return 0
 
 
-def handle_gha_post_daily(
-    args: argparse.Namespace,
-    settings: AppSettings,
-    logger: logging.Logger,
-) -> int:
-    env_values = load_gha_env_values()
-    account = build_gha_account(
-        account_name=args.account_name,
-        env_values=env_values,
-    )
-
-    local_today = _local_today(env_values["timezone"])
-    day_number = calculate_gha_day_number(
-        start_date=env_values["start_date"],
-        local_today=local_today,
-    )
-    day_caption = env_values["caption_template"].format(day_number=day_number)
-    final_caption = compose_caption(
-        caption=day_caption,
-        hashtags=env_values["hashtags"],
-    )
-    overlay_enabled = _env_flag(env_values["enable_video_overlay"])
-    event_mode = getenv_stripped("GITHUB_EVENT_NAME") or "local-shell"
-    overlay_sentence = None
-    if overlay_enabled:
-        overlay_sentence = select_overlay_sentence(
-            day_number=day_number,
-            csv_path=PROJECT_ROOT / "config" / "overlay_messages.csv",
-        )
-
-    base_video_url = env_values["video_url"]
-    validation = validate_public_video_url(
-        base_video_url,
-        timeout_seconds=settings.http_timeout_seconds,
-    )
-    planned_generated_url = None
-    if overlay_enabled:
-        planned_generated_url = (
-            f"{getenv_stripped('R2_PUBLIC_BASE_URL').rstrip('/')}/"
-            f"{build_generated_object_key(day_number=day_number, local_date=local_today)}"
-            if getenv_stripped("R2_PUBLIC_BASE_URL")
-            else "<R2_PUBLIC_BASE_URL>/generated/day-<N>-YYYY-MM-DD.mp4"
-        )
-
-    print("GitHub Actions daily post")
-    print(f"  Event mode: {event_mode}")
-    print(f"  Account: {account.account_name}")
-    print(f"  Date: {local_today.isoformat()}")
-    print(f"  Day number: {day_number}")
-    print(f"  Instagram username: {account.instagram_username}")
-    print(f"  IG User ID: {account.ig_user_id}")
-    print(f"  Base video URL: {base_video_url}")
-    print(f"  ENABLE_VIDEO_OVERLAY: {str(overlay_enabled).lower()}")
-    if overlay_sentence:
-        print(f"  Overlay sentence: {overlay_sentence}")
-    if overlay_enabled:
-        print(f"  Planned generated URL: {planned_generated_url}")
-    print(f"  Final caption: {final_caption}")
-    print(f"  INSTAGRAM_ACCESS_TOKEN: {mask_secret(_require_env_value('INSTAGRAM_ACCESS_TOKEN'))}")
-    print(f"  AUTO_POST_ENABLED: {str(settings.auto_post_enabled).lower()}")
-    print(f"  DRY_RUN: {str(settings.dry_run).lower()}")
-    if not settings.auto_post_enabled:
-        print("  Action: skip publish because AUTO_POST_ENABLED is not true")
-    elif settings.dry_run:
-        print("  Action: dry run only because DRY_RUN is true")
-    elif not overlay_enabled:
-        print("  Action: skip publish because ENABLE_VIDEO_OVERLAY is not true")
-    else:
-        print("  Action: preflight for a real overlay post")
-
-    if not validation.ok:
-        print(f"Validation failed: {validation.message}")
-        return 1
-
-    if not settings.auto_post_enabled:
-        print("AUTO_POST_ENABLED is not true. Dry-run only; skipping publish.")
-        if overlay_enabled:
-            print("Overlay mode dry run: would render a generated MP4, skip the R2 upload, and skip the Instagram publish.")
-        return 0
-    if settings.dry_run:
-        print("DRY_RUN is true. Dry-run only; skipping publish.")
-        if overlay_enabled:
-            print("Overlay mode dry run: would render a generated MP4, skip the R2 upload, and skip the Instagram publish.")
-        return 0
-    if not overlay_enabled:
-        print("ENABLE_VIDEO_OVERLAY is not true. Refusing to run a real GitHub Actions post without overlay mode.")
-        return 1
-
-    preflight_reasons = build_gha_overlay_real_post_blockers(
-        settings=settings,
-        env_values=env_values,
-        validation=validation,
-    )
-    if preflight_reasons:
-        print("Overlay posting is not ready:")
-        for reason in preflight_reasons:
-            print(f"  - {reason}")
-        return 1
-
-    client = InstagramClient(settings, logger=logger)
-    recent_media_result = check_recent_caption_duplicate(
-        client=client,
-        account=account,
-        expected_caption_fragment=day_caption,
-        force=args.force,
-    )
-    if recent_media_result == "already-posted":
-        print("Already posted today")
-        return 0
-    if recent_media_result == "cannot-check":
-        return 1
-
-    post_video_url = base_video_url
-    r2_config = load_r2_config_from_env()
-    object_key = build_generated_object_key(day_number=day_number, local_date=local_today)
-    render_plan = build_overlay_render_plan(
-        day_number=day_number,
-        local_date=local_today,
-        output_root=PROJECT_ROOT / "generated",
-        overlay_sentence=overlay_sentence or "",
-    )
-    logger.info(
-        "GitHub Actions overlay render starting account=%s day_number=%s base_video_url=%s object_key=%s overlay=%s",
-        account.account_name,
-        day_number,
-        base_video_url,
-        object_key,
-        overlay_sentence,
-    )
-    download_video(
-        url=base_video_url,
-        destination=render_plan.downloaded_video_path,
-        timeout_seconds=settings.http_timeout_seconds,
-    )
-    rendered_path = render_overlay_video(plan=render_plan)
-    post_video_url = upload_video_to_r2(
-        file_path=rendered_path,
-        object_key=object_key,
-        config=r2_config,
-    )
-    print(f"  Generated video URL: {post_video_url}")
-
-    try:
-        logger.info(
-            "GitHub Actions posting account=%s date=%s day_number=%s video_url=%s caption=%s",
-            account.account_name,
-            local_today.isoformat(),
-            day_number,
-            post_video_url,
-            final_caption,
-        )
-        result = client.publish_reel(
-            account=account,
-            video_url=post_video_url,
-            caption=final_caption,
-        )
-    except (ConfigurationError, InstagramApiError) as exc:
-        logger.error(
-            "GitHub Actions posting failed account=%s date=%s error=%s",
-            account.account_name,
-            local_today.isoformat(),
-            exc,
-        )
-        print(f"Posting failed: {exc}")
-        return 1
-
-    print(f"Posted media id: {result.media_id}")
-    if result.permalink:
-        print(f"Permalink: {result.permalink}")
-    return 0
-
-
-def handle_gha_schedule_readiness(
-    args: argparse.Namespace,
-    settings: AppSettings,
-) -> int:
-    timezone_name = getenv_stripped("DAILYVIRAL_TIMEZONE") or DEFAULT_GHA_TIMEZONE
-    utc_now = datetime.now(timezone.utc)
-    local_now = _now_in_timezone(timezone_name)
-    cron_expression = read_gha_workflow_cron_expression() or DEFAULT_GHA_SCHEDULE_CRON
-
-    env_presence = {name: bool(getenv_stripped(name)) for name in GHA_DAILY_REQUIRED_ENV_VARS}
-    r2_presence = {name: bool(getenv_stripped(name)) for name in R2_REQUIRED_ENV_VARS}
-    auto_post_enabled = settings.auto_post_enabled
-    dry_run = settings.dry_run
-    overlay_enabled = _env_flag(getenv_stripped("ENABLE_VIDEO_OVERLAY") or DEFAULT_GHA_ENABLE_VIDEO_OVERLAY)
-    video_url = getenv_stripped("DAILYVIRAL_VIDEO_URL")
-    start_date_value = getenv_stripped("DAILYVIRAL_START_DATE")
-    caption_template = getenv_stripped("DAILYVIRAL_CAPTION_TEMPLATE") or DEFAULT_GHA_CAPTION_TEMPLATE
-    hashtags = getenv_stripped("DAILYVIRAL_HASHTAGS") or DEFAULT_GHA_HASHTAGS
-
-    reasons: list[str] = []
-    start_date = ""
-    today_day_number: int | None = None
-    tomorrow_day_number: int | None = None
-    tomorrow_caption = ""
-    tomorrow_overlay = ""
-
-    if not start_date_value:
-        reasons.append("DAILYVIRAL_START_DATE is missing.")
-    else:
-        try:
-            start_date = _validate_date_string(start_date_value)
-            today_day_number = calculate_gha_day_number(
-                start_date=start_date,
-                local_today=local_now.date(),
-            )
-            tomorrow_day_number = calculate_gha_day_number(
-                start_date=start_date,
-                local_today=(local_now + timedelta(days=1)).date(),
-            )
-            tomorrow_caption = compose_caption(
-                caption=caption_template.format(day_number=tomorrow_day_number),
-                hashtags=hashtags,
-            )
-        except (ConfigurationError, KeyError, ValueError) as exc:
-            reasons.append(f"Could not compute day numbers from DAILYVIRAL_START_DATE: {exc}")
-
-    overlay_csv_path = PROJECT_ROOT / "config" / "overlay_messages.csv"
-    overlay_csv_ok = False
-    try:
-        load_overlay_messages(overlay_csv_path)
-        overlay_csv_ok = True
-        if tomorrow_day_number is not None:
-            tomorrow_overlay = select_overlay_sentence(
-                day_number=tomorrow_day_number,
-                csv_path=overlay_csv_path,
-            )
-    except ConfigurationError as exc:
-        reasons.append(str(exc))
-
-    validation: UrlValidationResult | None = None
-    if video_url:
-        validation = validate_public_video_url(
-            video_url,
-            timeout_seconds=settings.http_timeout_seconds,
-        )
-        if not validation.ok:
-            reasons.append(f"Base video URL is not reachable: {validation.message}")
-    else:
-        reasons.append("DAILYVIRAL_VIDEO_URL is missing.")
-
-    ffmpeg_available = shutil.which("ffmpeg") is not None
-    boto3_installed = importlib.util.find_spec("boto3") is not None
-
-    if not auto_post_enabled:
-        reasons.append("AUTO_POST_ENABLED is not true.")
-    if dry_run:
-        reasons.append("DRY_RUN is true.")
-    if not overlay_enabled:
-        reasons.append("ENABLE_VIDEO_OVERLAY is not true.")
-
-    for name, present in env_presence.items():
-        if not present:
-            reasons.append(f"{name} is missing.")
-    for name, present in r2_presence.items():
-        if not present:
-            reasons.append(f"{name} is missing.")
-
-    ig_user_id = getenv_stripped("IG_USER_ID")
-    if ig_user_id and is_placeholder_ig_user_id(ig_user_id):
-        reasons.append("IG_USER_ID still looks like a placeholder.")
-    if not ffmpeg_available:
-        reasons.append("ffmpeg is not available in PATH.")
-    if not boto3_installed:
-        reasons.append("boto3 is not installed.")
-    if not overlay_csv_ok:
-        reasons.append("Overlay message CSV is not readable.")
-
-    ready = not reasons
-
-    print("GitHub Actions schedule readiness")
-    print(f"  Account: {args.account_name}")
-    print(f"  Current UTC time: {utc_now.isoformat()}")
-    print(f"  Current {timezone_name} time: {local_now.isoformat()}")
-    print(f"  Workflow cron: {cron_expression}")
-    print(f"  DAILYVIRAL_START_DATE: {start_date_value or '<missing>'}")
-    print(f"  Today's day number: {today_day_number if today_day_number is not None else '<unavailable>'}")
-    print(f"  Tomorrow's day number: {tomorrow_day_number if tomorrow_day_number is not None else '<unavailable>'}")
-    print(f"  Expected caption for tomorrow: {tomorrow_caption or '<unavailable>'}")
-    print(f"  Expected overlay sentence for tomorrow: {tomorrow_overlay or '<unavailable>'}")
-    print(f"  AUTO_POST_ENABLED: {str(auto_post_enabled).lower()}")
-    print(f"  DRY_RUN: {str(dry_run).lower()}")
-    print(f"  ENABLE_VIDEO_OVERLAY: {str(overlay_enabled).lower()}")
-    print("  Instagram env vars:")
-    for name, present in env_presence.items():
-        print(f"    {name}: {'yes' if present else 'no'}")
-    print("  R2 env vars:")
-    for name, present in r2_presence.items():
-        print(f"    {name}: {'yes' if present else 'no'}")
-    print(f"  Base video URL reachable: {'yes' if validation and validation.ok else 'no'}")
-    print(f"  ffmpeg available: {'yes' if ffmpeg_available else 'no'}")
-    print(f"  boto3 installed: {'yes' if boto3_installed else 'no'}")
-
-    if ready:
-        print()
-        print("READY FOR NEXT SCHEDULED POST")
-        return 0
-
-    print()
-    print("NOT READY")
-    for reason in sorted(dict.fromkeys(reasons)):
-        print(f"  - {reason}")
-    return 1
-
-
 def schedule_days_for_account(
     *,
     account: AccountConfig,
@@ -1055,9 +755,9 @@ def determine_schedule_start_date(
     start_date: str | None,
 ) -> date:
     if start_date:
-        return _parse_date(start_date)
+        return parse_date(start_date)
 
-    local_today = _local_today(account.timezone)
+    local_today = current_local_date(account.timezone)
     tomorrow = local_today + timedelta(days=1)
     latest_future = queue_store.latest_scheduled_date(
         account.account_name,
@@ -1065,7 +765,7 @@ def determine_schedule_start_date(
         scheduled_after=local_today.isoformat(),
     )
     if latest_future:
-        return _parse_date(latest_future) + timedelta(days=1)
+        return parse_date(latest_future) + timedelta(days=1)
     return tomorrow
 
 
@@ -1073,9 +773,7 @@ def parse_clock_time(value: str) -> datetime_time:
     try:
         return datetime.strptime(value, "%H:%M").time()
     except ValueError as exc:
-        raise ConfigurationError(
-            f"Invalid time '{value}'. Expected format HH:MM."
-        ) from exc
+        raise ConfigurationError(f"Invalid time '{value}'. Expected format HH:MM.") from exc
 
 
 def write_launchd_plist(
@@ -1203,7 +901,9 @@ def _run_dry_run(account: AccountConfig, config: AppConfig, queue_store: QueueSt
         print("No due posts")
         return 0
 
-    preview = _build_post_preview(account=account, config=config, queue_store=queue_store, post=post)
+    preview = _build_post_preview(
+        account=account, config=config, queue_store=queue_store, post=post
+    )
     print_dry_run(
         post=post,
         account=account,
@@ -1224,14 +924,16 @@ def _execute_due_post(
     force: bool,
     explicit_dry_run: bool,
 ) -> int:
-    _assert_account_publish_config(account)
+    assert_account_publish_config(account)
 
     post = _next_due_post(account=account, queue_store=queue_store)
     if post is None:
         print("No due posts")
         return 0
 
-    preview = _build_post_preview(account=account, config=config, queue_store=queue_store, post=post)
+    preview = _build_post_preview(
+        account=account, config=config, queue_store=queue_store, post=post
+    )
     effective_dry_run = bool(
         explicit_dry_run or config.settings.dry_run or not config.settings.auto_post_enabled
     )
@@ -1245,7 +947,9 @@ def _execute_due_post(
             reason.append("AUTO_POST_ENABLED=false")
         print(f"Dry-run mode active: {', '.join(reason)}")
         if _account_already_posted_today(account, queue_store) and not force:
-            print("A post already succeeded today for this account. Live posting would stop without --force.")
+            print(
+                "A post already succeeded today for this account. Live posting would stop without --force."
+            )
         print_dry_run(
             post=post,
             account=account,
@@ -1255,7 +959,9 @@ def _execute_due_post(
         )
         return 0 if preview.validation.ok else 1
 
-    unsafe_reason = _posting_safety_reason(account=account, queue_store=queue_store, post=post, force=force)
+    unsafe_reason = _posting_safety_reason(
+        account=account, queue_store=queue_store, post=post, force=force
+    )
     if unsafe_reason:
         print(unsafe_reason)
         return 0
@@ -1357,7 +1063,7 @@ def _posting_safety_reason(
 
 
 def _next_due_post(account: AccountConfig, queue_store: QueueStore) -> PostRecord | None:
-    due_date = _today_in_timezone(account.timezone)
+    due_date = today_in_timezone(account.timezone)
     return queue_store.get_next_post(
         account.account_name,
         on_or_before=due_date,
@@ -1403,161 +1109,17 @@ def _build_post_preview(
     )
 
 
-def _assert_account_publish_config(account: AccountConfig) -> None:
-    if not account.instagram_username.strip():
-        raise ConfigurationError(
-            f"Account '{account.account_name}' is missing instagram_username in config/accounts.yaml."
-        )
-    if not account.ig_user_id.strip():
-        raise ConfigurationError(
-            f"Account '{account.account_name}' is missing ig_user_id in config/accounts.yaml."
-        )
-    if is_placeholder_ig_user_id(account.ig_user_id) or not account.ig_user_id.isdigit():
-        raise ConfigurationError(
-            f"Account '{account.account_name}' has a placeholder or invalid ig_user_id: {account.ig_user_id}"
-        )
-    if not account.access_token_env_var.strip():
-        raise ConfigurationError(
-            f"Account '{account.account_name}' is missing access_token_env_var in config/accounts.yaml."
-        )
-
-
 def _print_post_details(*, post: PostRecord, account: AccountConfig, final_caption: str) -> None:
     print(f"  Post ID: {post.id}")
     print(f"  Account: {account.account_name}")
     print(f"  Instagram username: {account.instagram_username}")
     print(f"  IG User ID: {account.ig_user_id}")
-    print(f"  Video URL: {post.video_url}")
+    print("  Video URL: [redacted]")
     print(f"  Caption: {post.caption or '<empty>'}")
     print(f"  Hashtags: {post.hashtags or '<empty>'}")
     print(f"  Final caption: {final_caption or '<empty>'}")
     print(f"  Scheduled date: {post.scheduled_date}")
     print(f"  Status: {post.status}")
-
-
-def load_gha_env_values() -> dict[str, str]:
-    values = {name: _require_env_value(name) for name in GHA_DAILY_REQUIRED_ENV_VARS}
-    values["caption_template"] = getenv_stripped("DAILYVIRAL_CAPTION_TEMPLATE") or DEFAULT_GHA_CAPTION_TEMPLATE
-    values["hashtags"] = getenv_stripped("DAILYVIRAL_HASHTAGS") or DEFAULT_GHA_HASHTAGS
-    values["timezone"] = getenv_stripped("DAILYVIRAL_TIMEZONE") or DEFAULT_GHA_TIMEZONE
-    values["enable_video_overlay"] = getenv_stripped("ENABLE_VIDEO_OVERLAY") or DEFAULT_GHA_ENABLE_VIDEO_OVERLAY
-    values["start_date"] = _validate_date_string(values["DAILYVIRAL_START_DATE"])
-    values["video_url"] = values["DAILYVIRAL_VIDEO_URL"]
-    return values
-
-
-def build_gha_overlay_real_post_blockers(
-    *,
-    settings: AppSettings,
-    env_values: dict[str, str],
-    validation: UrlValidationResult,
-) -> list[str]:
-    reasons: list[str] = []
-
-    for name in GHA_DAILY_REQUIRED_ENV_VARS:
-        if not env_values.get(name):
-            reasons.append(f"{name} is missing.")
-    for name in R2_REQUIRED_ENV_VARS:
-        if not getenv_stripped(name):
-            reasons.append(f"{name} is missing.")
-
-    if not getenv_stripped("INSTAGRAM_ACCESS_TOKEN"):
-        reasons.append("INSTAGRAM_ACCESS_TOKEN is missing.")
-    if not getenv_stripped("IG_USER_ID"):
-        reasons.append("IG_USER_ID is missing.")
-    elif is_placeholder_ig_user_id(getenv_stripped("IG_USER_ID")):
-        reasons.append("IG_USER_ID still looks like a placeholder.")
-    if not validation.ok:
-        reasons.append(f"Base video URL is not reachable: {validation.message}")
-    if shutil.which("ffmpeg") is None:
-        reasons.append("ffmpeg is not available in PATH.")
-    if importlib.util.find_spec("boto3") is None:
-        reasons.append("boto3 is not installed.")
-    overlay_csv_path = PROJECT_ROOT / "config" / "overlay_messages.csv"
-    try:
-        load_overlay_messages(overlay_csv_path)
-    except ConfigurationError as exc:
-        reasons.append(str(exc))
-
-    return reasons
-
-
-def read_gha_workflow_cron_expression() -> str | None:
-    if not WORKFLOW_PATH.exists():
-        return None
-
-    content = WORKFLOW_PATH.read_text(encoding="utf-8")
-    match = re.search(r'cron:\s*"([^"]+)"', content)
-    if match:
-        return match.group(1).strip()
-    return None
-
-
-def build_gha_account(*, account_name: str, env_values: dict[str, str]) -> AccountConfig:
-    account = AccountConfig(
-        account_name=account_name,
-        instagram_username=env_values["INSTAGRAM_USERNAME"],
-        ig_user_id=env_values["IG_USER_ID"],
-        access_token_env_var="INSTAGRAM_ACCESS_TOKEN",
-        default_caption_template=env_values["caption_template"],
-        default_hashtags=env_values["hashtags"],
-        required_hashtags="",
-        timezone=env_values["timezone"],
-    )
-    _assert_account_publish_config(account)
-    return account
-
-
-def calculate_gha_day_number(*, start_date: str, local_today: date) -> int:
-    first_day = _parse_date(start_date)
-    delta_days = (local_today - first_day).days
-    if delta_days < 0:
-        raise ConfigurationError(
-            f"DAILYVIRAL_START_DATE {start_date} is in the future relative to {local_today.isoformat()}."
-        )
-    return delta_days + 1
-
-
-def check_recent_caption_duplicate(
-    *,
-    client: InstagramClient,
-    account: AccountConfig,
-    expected_caption_fragment: str,
-    force: bool,
-) -> str:
-    if force:
-        print("Force flag enabled. Skipping recent-caption duplicate check.")
-        return "force"
-
-    try:
-        recent_media = client.fetch_recent_media(account=account, limit=12)
-    except InstagramApiError as exc:
-        print(
-            "Warning: could not check recent media captions through the official API. "
-            f"Error: {exc}"
-        )
-        print("Retry with --force only if you are certain this run has not already posted today.")
-        return "cannot-check"
-
-    for record in recent_media:
-        if expected_caption_fragment in record.caption:
-            print(
-                "Recent media caption match found: "
-                f"{record.media_id or '<unknown id>'} {record.permalink or '<no permalink>'}"
-            )
-            return "already-posted"
-    return "not-found"
-
-
-def _require_env_value(name: str) -> str:
-    value = getenv_stripped(name)
-    if value:
-        return value
-    raise ConfigurationError(f"Environment variable '{name}' is required but not set.")
-
-
-def _env_flag(value: str) -> bool:
-    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _print_report_line(passed: bool, label: str, detail: str) -> None:
@@ -1579,7 +1141,7 @@ def print_dry_run(
         "account_name": post.account_name,
         "instagram_username": account.instagram_username,
         "ig_user_id": account.ig_user_id,
-        "video_url": post.video_url,
+        "video_url": "[redacted]",
         "caption": post.caption,
         "hashtags": post.hashtags,
         "final_caption": final_caption,
@@ -1587,7 +1149,10 @@ def print_dry_run(
         "account_timezone": account.timezone,
         "AUTO_POST_ENABLED": settings.auto_post_enabled,
         "DRY_RUN": settings.dry_run,
-        "validation": asdict(validation),
+        "validation": {
+            **asdict(validation),
+            "final_url": "[redacted]" if validation.final_url else None,
+        },
     }
     print("Dry run")
     print(json.dumps(payload, indent=2))
@@ -1605,32 +1170,3 @@ def _required_value(label: str, *, interactive: bool) -> str:
     if interactive:
         return prompt(label)
     raise ConfigurationError(f"{label} is required when running non-interactively.")
-
-
-def _validate_date_string(value: str) -> str:
-    return _parse_date(value).isoformat()
-
-
-def _parse_date(value: str) -> date:
-    try:
-        return datetime.strptime(value, "%Y-%m-%d").date()
-    except ValueError as exc:
-        raise ConfigurationError(
-            f"Invalid date '{value}'. Expected format YYYY-MM-DD."
-        ) from exc
-
-
-def _now_in_timezone(timezone_name: str) -> datetime:
-    try:
-        zone = ZoneInfo(timezone_name)
-    except ZoneInfoNotFoundError as exc:
-        raise ConfigurationError(f"Unknown timezone '{timezone_name}'.") from exc
-    return datetime.now(zone)
-
-
-def _local_today(timezone_name: str) -> date:
-    return _now_in_timezone(timezone_name).date()
-
-
-def _today_in_timezone(timezone_name: str) -> str:
-    return _local_today(timezone_name).isoformat()

@@ -1,10 +1,73 @@
-.env
-__pycache__/
-*.pyc
+# Local secrets and private account configuration
+.env*
+*.env
+!.env.example
+config/accounts*.yaml
+!config/accounts.example.yaml
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*.json
+secrets*.json
 
-config/accounts.yaml
-data/posts.sqlite
-data/launchd/
-logs/
+# Python environments, bytecode, and build output
+.venv*/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+*.whl
+dist/
+build/
+
+# Test, lint, and type-checking caches and reports
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+.hypothesis/
+.tox/
+.nox/
+.coverage*
+coverage.xml
+htmlcov/
+
+# Local queue data and scheduler output; keep sanitized examples
+*.sqlite*
+*.db*
+/data/*
+!/data/.gitkeep
+!/data/*.example.json
+
+# Logs and rendered media; keep the empty log-directory placeholder
+/logs/*
+!/logs/.gitkeep
 *.log
 generated/
+*.mp4
+*.mov
+*.m4v
+*.webm
+
+# Local editor and agent state
+.vscode/
+.idea/
+.claude/
+.codex/
+*.swp
+*.swo
+*~
+
+# Operating-system and temporary files
+.DS_Store
+._*
+Thumbs.db
+Desktop.ini
+*.tmp
+*.temp
+
+# Optional local dependency manifests and development lockfile
+/requirements.in
+/requirements-dev.in
+/requirements-dev.txt

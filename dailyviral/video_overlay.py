@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 import csv
+import os
 import shutil
 import subprocess
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
-import requests
-
 from .config import ConfigurationError
+from .http import copy_video_body, open_public_url
+from .security import redact_sensitive
 
 
 @dataclass(slots=True)
@@ -79,17 +80,10 @@ def download_video(
     timeout_seconds: int,
 ) -> Path:
     destination.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        with requests.get(url, stream=True, timeout=timeout_seconds) as response:
-            response.raise_for_status()
-            with destination.open("wb") as handle:
-                for chunk in response.iter_content(chunk_size=1024 * 512):
-                    if chunk:
-                        handle.write(chunk)
-    except requests.RequestException as exc:
-        raise ConfigurationError(
-            f"Could not download the base video for overlay rendering: {exc}"
-        ) from exc
+    with open_public_url(url, timeout_seconds=timeout_seconds) as (response, _):
+        if not 200 <= response.status < 300:
+            raise ConfigurationError("Base-video download returned an unsuccessful HTTP status.")
+        copy_video_body(response, destination)
     return destination
 
 
@@ -100,7 +94,8 @@ def render_overlay_video(
     font_color: str = "white",
     margin_px: int = 30,
 ) -> Path:
-    if shutil.which(ffmpeg_bin) is None:
+    ffmpeg_path = shutil.which(ffmpeg_bin)
+    if ffmpeg_path is None:
         raise ConfigurationError(
             "ffmpeg is required for ENABLE_VIDEO_OVERLAY=true but was not found in PATH."
         )
@@ -110,7 +105,7 @@ def render_overlay_video(
 
     filtergraph = (
         "drawtext="
-        "textfile=overlay.txt:"
+        "textfile=overlay.txt:expansion=none:"
         f"fontcolor={font_color}:"
         "fontsize=h*0.045:"
         f"x=w-tw-{margin_px}:"
@@ -123,36 +118,46 @@ def render_overlay_video(
         "shadowy=2"
     )
 
-    result = subprocess.run(
-        [
-            ffmpeg_bin,
-            "-y",
-            "-i",
-            plan.downloaded_video_path.name,
-            "-vf",
-            filtergraph,
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-pix_fmt",
-            "yuv420p",
-            "-movflags",
-            "+faststart",
-            "-c:a",
-            "copy",
-            plan.output_video_path.name,
-        ],
-        cwd=plan.work_dir,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            [
+                ffmpeg_path,
+                "-y",
+                "-nostdin",
+                "-protocol_whitelist",
+                "file",
+                "-f",
+                "mov",
+                "-i",
+                plan.downloaded_video_path.name,
+                "-vf",
+                filtergraph,
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                "-c:a",
+                "copy",
+                plan.output_video_path.name,
+            ],
+            cwd=plan.work_dir,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=300,
+            env={"PATH": os.defpath, "LANG": "C.UTF-8"},
+        )
+    except subprocess.TimeoutExpired:
+        raise ConfigurationError("FFmpeg exceeded the five-minute render limit.") from None
     if result.returncode != 0:
-        stderr = (result.stderr or "").strip()
+        stderr = redact_sensitive((result.stderr or "").strip())
         raise ConfigurationError(
             "ffmpeg failed to render the overlay video: "
-            f"{stderr or result.stdout.strip() or 'unknown ffmpeg error'}"
+            f"{stderr or redact_sensitive(result.stdout.strip()) or 'unknown ffmpeg error'}"
         )
 
     if not plan.output_video_path.exists():

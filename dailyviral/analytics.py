@@ -18,7 +18,7 @@ def build_report(
     *,
     account_name: str | None = None,
 ) -> AnalyticsReport:
-    status_totals = queue_store.status_counts()
+    status_totals = queue_store.status_counts(account_name=account_name)
 
     if account_name:
         account_rows = [

@@ -1,17 +1,36 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import requests
 
-from .config import AccountConfig, AppSettings, require_access_token
+from .config import AccountConfig, AppSettings, ConfigurationError, require_access_token
+from .security import mask_github_secret
 
 
 class InstagramApiError(RuntimeError):
     """Raised when the Instagram Graph API returns an error."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: int | None = None,
+        subcode: int | None = None,
+        fbtrace_id: str | None = None,
+    ):
+        super().__init__(message)
+        self.code = code
+        self.subcode = subcode
+        self.fbtrace_id = fbtrace_id
+
+
+class InstagramTokenError(InstagramApiError):
+    """Raised when Meta rejects an expired, revoked, or otherwise invalid token."""
 
 
 class PublishingLimitError(InstagramApiError):
@@ -47,6 +66,12 @@ class InstagramMediaRecord:
     media_product_type: str | None
 
 
+@dataclass(slots=True)
+class InstagramTokenRefreshResult:
+    access_token: str = field(repr=False)
+    expires_in_seconds: int | None
+
+
 class InstagramClient:
     def __init__(
         self,
@@ -55,9 +80,56 @@ class InstagramClient:
         logger: logging.Logger | None = None,
         session: requests.Session | None = None,
     ):
+        if settings.graph_api_base_url not in {
+            "https://graph.instagram.com",
+            "https://graph.facebook.com",
+        }:
+            raise ConfigurationError("GRAPH_API_BASE_URL must be an official HTTPS Meta origin.")
+        if not re.fullmatch(r"v[0-9]+\.[0-9]+", settings.graph_api_version):
+            raise ConfigurationError("GRAPH_API_VERSION must use vNN.N format.")
         self.settings = settings
         self.logger = logger or logging.getLogger("dailyviral")
         self.session = session or requests.Session()
+        self.session.trust_env = False
+
+    def refresh_long_lived_access_token(
+        self,
+        account: AccountConfig,
+    ) -> InstagramTokenRefreshResult:
+        """Extend an unexpired Instagram long-lived token for another 60 days.
+
+        Meta's refresh endpoint is intentionally not Graph-API-versioned. The token
+        must already be long-lived and must not have expired.
+        """
+        current_token = require_access_token(account)
+        payload = self._request_url_json(
+            "GET",
+            f"{self.settings.graph_api_base_url}/refresh_access_token",
+            token=current_token,
+            params={"grant_type": "ig_refresh_token"},
+        )
+        refreshed_token = str(payload.get("access_token", "")).strip()
+        if not refreshed_token:
+            raise InstagramApiError(
+                "Instagram token refresh succeeded without returning an access token."
+            )
+
+        raw_expires_in = payload.get("expires_in")
+        try:
+            expires_in_seconds = int(raw_expires_in) if raw_expires_in is not None else None
+        except (TypeError, ValueError):
+            expires_in_seconds = None
+
+        self.logger.info(
+            "Refreshed Instagram access token for %s; expires_in_seconds=%s",
+            account.account_name,
+            expires_in_seconds if expires_in_seconds is not None else "<unknown>",
+        )
+        mask_github_secret(refreshed_token)
+        return InstagramTokenRefreshResult(
+            access_token=refreshed_token,
+            expires_in_seconds=expires_in_seconds,
+        )
 
     def get_content_publishing_limit(self, account: AccountConfig) -> PublishingLimit | None:
         token = require_access_token(account)
@@ -79,17 +151,14 @@ class InstagramClient:
 
         if quota_usage is None or quota_total is None:
             self.logger.warning(
-                "Instagram content publishing limit response did not include quota fields: %s",
-                payload,
+                "Instagram content publishing limit response did not include quota fields",
             )
             return None
 
         return PublishingLimit(
             quota_usage=int(quota_usage),
             quota_total=int(quota_total),
-            quota_duration_seconds=int(quota_duration)
-            if quota_duration is not None
-            else None,
+            quota_duration_seconds=int(quota_duration) if quota_duration is not None else None,
         )
 
     def assert_can_publish(self, account: AccountConfig) -> PublishingLimit | None:
@@ -163,7 +232,7 @@ class InstagramClient:
         )
         creation_id = str(payload.get("id", "")).strip()
         if not creation_id:
-            raise InstagramApiError(f"Instagram did not return a creation id: {payload}")
+            raise InstagramApiError("Instagram did not return a creation id.")
         self.logger.info(
             "Created Instagram media container for %s: %s",
             account.account_name,
@@ -181,7 +250,6 @@ class InstagramClient:
             )
             status_code = str(payload.get("status_code", "")).upper()
             status = str(payload.get("status", "")).upper()
-            error_message = str(payload.get("error_message", "")).strip()
 
             self.logger.info(
                 "Polled container %s attempt %s: status_code=%s status=%s",
@@ -198,9 +266,8 @@ class InstagramClient:
                 "EXPIRED",
                 "FAILED",
             }:
-                details = error_message or payload
                 raise InstagramApiError(
-                    f"Instagram media processing failed for container {creation_id}: {details}"
+                    f"Instagram media processing failed for container {creation_id}."
                 )
 
             time.sleep(4)
@@ -224,7 +291,7 @@ class InstagramClient:
         )
         media_id = str(payload.get("id", "")).strip()
         if not media_id:
-            raise InstagramApiError(f"Instagram did not return a media id: {payload}")
+            raise InstagramApiError("Instagram did not return a media id.")
         self.logger.info(
             "Published Instagram media for %s: media_id=%s",
             account.account_name,
@@ -240,7 +307,7 @@ class InstagramClient:
             params={"fields": "id,permalink,media_type,media_product_type"},
         )
         permalink = str(payload.get("permalink", "")).strip()
-        self.logger.info("Fetched media details for %s: %s", media_id, payload)
+        self.logger.info("Fetched media details for %s", media_id)
         return permalink or None
 
     def fetch_recent_media(
@@ -261,9 +328,7 @@ class InstagramClient:
         )
         rows = payload.get("data", [])
         if not isinstance(rows, list):
-            raise InstagramApiError(
-                f"Instagram recent media response was not a list: {payload}"
-            )
+            raise InstagramApiError("Instagram recent media response was not a list.")
 
         records: list[InstagramMediaRecord] = []
         for row in rows:
@@ -290,13 +355,33 @@ class InstagramClient:
         params: dict[str, Any] | None = None,
         data: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        if not re.fullmatch(r"/[0-9]+(?:/[a-z_]+)?", path):
+            raise ConfigurationError("Instagram resource paths must contain numeric IDs.")
         url = f"{self.settings.graph_api_base_url}/{self.settings.graph_api_version}{path}"
+        return self._request_url_json(
+            method,
+            url,
+            token=token,
+            params=params,
+            data=data,
+        )
+
+    def _request_url_json(
+        self,
+        method: str,
+        url: str,
+        *,
+        token: str,
+        params: dict[str, Any] | None = None,
+        data: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         request_params = dict(params or {})
         request_data = dict(data or {})
-        if method.upper() == "POST":
-            request_data["access_token"] = token
-        else:
+        # The refresh endpoint requires a query token; other API calls use a header.
+        headers = {"Authorization": f"Bearer {token}"}
+        if url.endswith("/refresh_access_token"):
             request_params["access_token"] = token
+            headers = {}
 
         try:
             response = self.session.request(
@@ -305,30 +390,54 @@ class InstagramClient:
                 params=request_params if method.upper() != "POST" else None,
                 data=request_data if method.upper() == "POST" else None,
                 timeout=self.settings.http_timeout_seconds,
+                headers=headers,
+                allow_redirects=False,
             )
-        except requests.RequestException as exc:
-            raise InstagramApiError(f"Network error calling Instagram Graph API: {exc}") from exc
+        except requests.RequestException:
+            raise InstagramApiError("Network error calling Instagram Graph API.") from None
 
         try:
             payload = response.json()
         except ValueError:
-            body_preview = response.text[:400]
             raise InstagramApiError(
-                "Instagram Graph API returned a non-JSON response: "
-                f"HTTP {response.status_code} {body_preview}"
-            )
+                f"Instagram Graph API returned a non-JSON response: HTTP {response.status_code}."
+            ) from None
+        finally:
+            response.close()
 
-        if response.ok and "error" not in payload:
+        if not isinstance(payload, dict):
+            raise InstagramApiError("Instagram Graph API returned an invalid response shape.")
+        if 200 <= response.status_code < 300 and "error" not in payload:
             return payload
 
         error = payload.get("error", {})
+        if not isinstance(error, dict):
+            error = {}
         message = error.get("message") or payload
         code = error.get("code")
         subcode = error.get("error_subcode")
-        fbtrace = error.get("fbtrace_id")
-        raise InstagramApiError(
-            f"Instagram Graph API error: {message} "
-            f"(code={code}, subcode={subcode}, fbtrace_id={fbtrace})"
+        try:
+            numeric_code = int(code) if code is not None else None
+        except (TypeError, ValueError):
+            numeric_code = None
+        try:
+            numeric_subcode = int(subcode) if subcode is not None else None
+        except (TypeError, ValueError):
+            numeric_subcode = None
+
+        error_type = (
+            InstagramTokenError
+            if numeric_code == 190 or is_token_error(str(message))
+            else InstagramApiError
+        )
+        raise error_type(
+            f"Instagram authentication failed: token invalid or expired (code={numeric_code})."
+            if error_type is InstagramTokenError
+            else f"Instagram Graph API request failed (HTTP {response.status_code}, "
+            f"code={numeric_code}, subcode={numeric_subcode}).",
+            code=numeric_code,
+            subcode=numeric_subcode,
+            fbtrace_id=None,
         )
 
 
